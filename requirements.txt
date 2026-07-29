@@ -1,0 +1,11 @@
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1
+xlsxwriter>=3.2
+python-calamine>=0.2
+SQLAlchemy>=2.0
+pyodbc>=5.0
+pdfplumber>=0.11
+# Only for scripts that drive a live Excel instance (COM):
+xlwings>=0.31
+pywin32>=306
