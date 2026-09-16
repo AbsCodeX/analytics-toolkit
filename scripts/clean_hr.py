@@ -48,7 +48,7 @@ Name standardization:
     Fixed alias map first (Lastname07 Nickname07 -> Lastname07 Firstname07, etc.), then a strict
     fuzzy backup: only matches when the last name (part before the comma) is an
     exact case-insensitive match AND the first name fuzzy-matches at cutoff 0.85.
-    This blocks false positives like Lastname12, Melissa -> Lastname12, Firstname12 or
+    This blocks false positives like Lastname12, Othername -> Lastname12, Firstname12 or
     SimilarLastname, Firstname10 -> Lastname10, Firstname10. Anything genuine the fuzzy
     matcher misses can be added explicitly to NAME_ALIASES.
 """
@@ -566,6 +566,27 @@ def main() -> None:
             print(f"  Lastname03 tier rule: moved {int(mask.sum())} {column} cell(s) to SVP.")
             df.loc[mask, "SVP"] = lastname03
             df.loc[mask, column] = pd.NA
+    # 2026-09-04: the HR export moved Lastname03 UP a tier — every Rev Cycle row
+    # now carries him in EVP with SVP blank (8/31: SVP=Lastname03 for 7,522 rows;
+    # 9/4: SVP=Lastname03 for 0, EVP=Lastname03 for 8,025). The whole pipeline defines
+    # "our org" as SVP = Lastname03 (add_missing_to_master, audit notes, the
+    # HR-apply SVP column on the Master, the boss HR gap report), and the
+    # Master has an SVP column but no EVP column, so the 9/4 morning run
+    # blanked ~7,400 Master SVP cells and found 0 HR candidates to add. Mirror
+    # EVP Lastname03 into a BLANK SVP (EVP itself is left as HR reports it). A row
+    # with EVP = Lastname03 AND a different SVP already filled is left alone and
+    # counted, so a new SVP layer under him would show up here, not vanish.
+    evp_brogan = df["EVP"].astype("string").str.strip().eq(lastname03).fillna(False)
+    svp_blank = df["SVP"].isna() | df["SVP"].astype("string").str.strip().eq("").fillna(False)
+    mirror = evp_brogan & svp_blank
+    if mirror.any():
+        print(f"  Lastname03 tier rule: EVP = Lastname03 on {int(evp_brogan.sum()):,} rows; "
+              f"mirrored into blank SVP on {int(mirror.sum()):,} of them.")
+        df.loc[mirror, "SVP"] = lastname03
+    other_svp = int((evp_brogan & ~svp_blank).sum())
+    if other_svp:
+        print(f"  NOTE: {other_svp:,} row(s) have EVP = Lastname03 but a different SVP filled — "
+              "left as-is; review whether a new SVP tier exists under him.")
     df["Full Name"] = df[SRC_FULL_NAME]
     df["GoLiveWave"] = clean_text_series(df[SRC_WAVE]).str.title()
     df["Email"] = df[SRC_EMAIL]

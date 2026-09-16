@@ -42,16 +42,16 @@ run report). `--list`, `--from <step>`, `--only <step>`, `--skip <step>`,
 
 ## Step 0 — drop the fresh exports (manual, filenames must match)
 
-| Export                                           | Drop into (OneDrive`data\raw\...`)         | Cadence   |
-| ------------------------------------------------ | -------------------------------------------- | --------- |
-| `HR.xlsx` (Workday)                            | `hr\`                                      | Weekly    |
-| `User MappingsData.csv` (+ Role/JobCategories) | `mvp\`                                     | Daily     |
-| `Epic Team Member Lookup.xlsx` (pre-combined)  | `epic\epic_tm_lookup\`                     | Daily     |
-| `Curriculum Status Detail by User - W*.xlsx`   | `epic\epic_status_details\`                | Daily     |
-| `epic_class_schedule_YYYYMMDD.xlsx`            | `epic\epic_class_schedules\`               | As needed |
-| `Enterprise_Training_Report_*.xlsx`            | `cornerstone\enterprise_training_reports\` | Daily     |
-| `Roster_Report_by_Event*.xlsx`                 | `cornerstone\roster_report\`               | PAUSED 2026-07-27 (last resort — see source_registry notes) |
-| `Wave Change Request Form*.xlsx`               | `wave\wave_change_requests\`               | As needed |
+| Export                                           | Drop into (OneDrive`data\raw\...`)         | Cadence                                                      |
+| ------------------------------------------------ | -------------------------------------------- | ------------------------------------------------------------ |
+| `HR.xlsx` (Workday)                            | `hr\`                                      | Weekly                                                       |
+| `User MappingsData.csv` (+ Role/JobCategories) | `mvp\`                                     | Daily                                                        |
+| `Epic Team Member Lookup.xlsx` (pre-combined)  | `epic\epic_tm_lookup\`                     | Daily                                                        |
+| `Curriculum Status Detail by User - W*.xlsx`   | `epic\epic_status_details\`                | Daily                                                        |
+| `epic_class_schedule.xlsx`                     | `epic\epic_class_schedules\`               | Daily (2×/day when possible)                                 |
+| `Enterprise_Training_Report.xlsx`              | `cornerstone\enterprise_training_reports\` | Daily                                                        |
+| `Roster_Report_by_Events.xlsx`                 | `cornerstone\roster_report\`               | PAUSED 2026-07-27 (last resort — see source_registry notes) |
+| `Wave Change Request Form*.xlsx`               | `wave\wave_change_requests\`               | As needed                                                    |
 
 (2026-07-17: the `Transcript_Status_*` and `Online_Training_Status*` exports
 are retired — the Enterprise Training Report now carries full history + Online
@@ -72,7 +72,7 @@ whole-day chain is now retired in favor of this script).
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
 | `preflight`      | Source freshness, SQL reachable, Master-lock warning                                                                                                          | —                                       |
 | `clean_hr`       | Raw HR → dated`HR_cleaned_*.xlsx`                                                                                                                          | only if raw HR newer than latest cleaned |
-| `sql_refresh`    | Change-aware (2026-07-10): loads only sources whose files changed since the last load (shared auto_refresh state); always guarantees today's history snapshot | daily                                    |
+| `sql_refresh`    | Change-aware (2026-07-10): loads only sources whose files changed since the last load (shared auto_refresh state); always guarantees today's history snapshot. Since 2026-09-04 a file younger than 60 s (the cleaned HR that `clean_hr` just wrote) is waited on until it settles, then loaded in the same run — it used to be deferred to the 13:00 task, leaving SQL's HR one cycle behind on HR days | daily                                    |
 | `hr_preview`     | Read-only HR leader-change preview CSV                                                                                                                        | daily                                    |
 | `morning_review` | Builds**Morning Review.xlsx**                                                                                                                           | daily                                    |
 
@@ -108,19 +108,40 @@ daily full backup — the revert points; at most one per file per day)
 (add_missing_to_master.py --apply: appends people missing from the Master —
 Epic "Revenue Cycle - Centralized" + HR Lastname03-org actives — prints the full
 add-list + review CSV first; a >150-candidate sanity cap aborts the apply)
-→ `mvp_update` → `hr_apply` (xlwings/COM)
+→ `mvp_update` → `hr_apply` (xlwings/COM) → `email`
+→ `participation` (2026-09-09, her rule "those columns should not be blank":
+fill_master_participation_defaults.py --apply writes No into every blank
+FEC Participant? / Soft Live Participant cell — new rows from add_members
+arrive blank. Blanks only; typed answers untouched; no-op once full)
 → `gaps_hr` (weekly gate: the shared HR gap workbook)
-→ `sql_post` (reload Master + re-stamp today's history — must precede the
-report steps, whose views join `raw.master`)
+→ `sql_stage` (2026-08-11: **SQL updates after the wave file.** Master-only
+reload, no snapshot — puts today's finished roster into `raw.master` so
+`report.users`, and `report.tracker_training_status` on top of it, include
+people `add_members` appended minutes ago. Without it those people wait a full
+day for their status. ~5s)
+→ `training_status` (2026-08-11: update_master_training_status.py --apply
+mirrors `report.tracker_training_status` onto DATA cols BG–BJ — Training
+Status, Anticipated Training Completion Date, Epic Status Fully Registered /
+Fully Trained. Same numbers as the tracker's Completion Status sheet. Blank
+outside the training-needed population and for `OnLeaderList = 0`; the date
+cell reads `Completed (Equivalent)` when someone earned equivalency credit,
+which Epic never dates. Empty-load guards: aborts under 1,000 source rows or a
+>20% fall in filled rows. Run with no flag for a read-only preview CSV)
+→ `sql_post` (reload Master + re-stamp today's history from the FINISHED
+workbook — must precede the report steps, whose views join `raw.master`)
+→ `lava_workbook` (2026-09-03: `build_lava_list.py` — rebuilds the LAVA
+workbook in Main Reports from the same SQL sources as `report.lava_list`;
+must precede `tracker`, which copies its four sheets in as snapshots)
 → `boss_reports`
-→ `tracker` (rebuilds `RCM Training Tracker.xlsx` + `RCM Training Daily
-Log.xlsx` — built and QA'd in local `build_staging\`, then published
+→ `tracker` (rebuilds `RCM Training Tracker.xlsx` + `RCM Training Daily Log.xlsx` — built and QA'd in local `build_staging\`, then published
 atomically to `data\reports\Main Reports\`; both files must be CLOSED in
 Excel or the step aborts cleanly; resume with `--from tracker`. Midday
-refresh without the full pipeline: `python
-scripts\build_rcm_training_tracker.py`, safe every 2 hours)
+refresh without the full pipeline: `python scripts\build_rcm_training_tracker.py`, safe every 2 hours)
 → `metrics` (SQL-based; reads the gap views directly since 2026-07-27)
 → `team_file` (publishes `RCM Wave Team File.xlsx` + dated distribution copy)
+→ (`wave_file_copy` RETIRED 2026-09-10 — she keeps one main copy of the wave
+file and makes any leadership copy herself; `build_wave_file_copy.py` is in
+`scripts\_archive\`, the last published copy in `Main Reports\_retired_wave_file_copy_2026-09-10\`.)
 → `review_refresh` (2026-07-28: rebuilds **Morning Review.xlsx** LAST so it
 reports the finished run — Today's Run step results, Files Updated flags,
 Run History, Activity Log, clickable Directory, post-apply gap sheets. Sheets
@@ -140,12 +161,24 @@ W3 package — the tracker + Daily Log cover it). Scripts archived under
 questions go to the Daily Log. Apply runtime dropped ~5.5 minutes.)
 
 Safety net (all pre-existing, all still active): lock-check aborts, once-daily
-full backup in `data\reports\archive\<month>\`, values-only DATA snapshot after
-every edit, header-integrity + empty-load guards, per-script runlogs.
+full backup in `data\reports\archive\<month>\` (LOCAL since 2026-08-11),
+values-only DATA snapshot after every edit, header-integrity + empty-load
+guards, per-script runlogs.
 
 ## Where things land
 
-- **Team:** `data\reports\Main Reports\RCM Wave Team File.xlsx` (share this, never the Master)
+**Two roots since 2026-08-11.** The Master and everything that belongs to it are
+LOCAL, under the repo — `yourorg_analytics\data\` mirrors the OneDrive tree, so
+only the root differs. Everything shared stays on OneDrive
+(`shared_workspace\data\`). Paths below are relative to whichever root owns them;
+`scripts\onedrive_paths.py` is the authority.
+
+- **Master (LOCAL):** `yourorg_analytics\data\reports\Main Reports\RCM Wave Data Master File.xlsx`
+  — with its daily backups (`data\reports\archive\<month>\`), DATA snapshots
+  (`data\processed\wave\wave_data_copies\wave_repository_copies\<month>\`),
+  new-member review CSVs and the HR/training preview CSVs. Nothing here syncs;
+  the retired OneDrive copy sits in `Main Reports\_retired_master_2026-08-11\`.
+- **Team:** `data\reports\Main Reports\RCM Wave Team File.xlsx` (OneDrive — share this, never the Master)
 - **Boss:** `data\reports\gap_reports\` (both "(Latest)" reports + dated copies)
 - **Tracker:** `data\reports\Main Reports\` — RCM Training Tracker + Daily Log
   (no-shows, unregistered, audits, trend all live here since 2026-07-27; the
@@ -184,15 +217,14 @@ every edit, header-integrity + empty-load guards, per-script runlogs.
 "apply stays manual" rule):** the FULL run is now scheduled. Weekday morning
 order:
 
-| Time | Task | What |
-| --- | --- | --- |
-| 8:30 | `YourOrgSQLAutoRefresh` | change-aware SQL load (early exports) |
-| 9:35 | `YourOrgDailyRefresh` | `daily_refresh.py auto` — full prep+apply, ~15 min (after the MVP export lands ~9:00–9:30) |
-| 10:00 | `YourOrgW3Tracker` | `w3_exec_brief.py` (reads the freshly loaded SQL) |
-| 11:00 / 13:00 / 14:30 | `YourOrgSQLAutoRefresh` | midday change-aware SQL loads (catch late exports) |
+| Time                  | Task                        | What                                                                                           |
+| --------------------- | --------------------------- | ---------------------------------------------------------------------------------------------- |
+| 8:30                  | `YourOrgSQLAutoRefresh` | change-aware SQL load (early exports)                                                          |
+| 9:35                  | `YourOrgDailyRefresh`   | `daily_refresh.py auto` — full prep+apply, ~15 min (after the MVP export lands ~9:00–9:30) |
+| 10:00                 | `YourOrgW3Tracker`      | `w3_exec_brief.py` (reads the freshly loaded SQL)                                            |
+| 11:00 / 13:00 / 14:30 | `YourOrgSQLAutoRefresh` | midday change-aware SQL loads (catch late exports)                                             |
 
-`YourOrgDailyRefresh` runs `analytics_env\Scripts\pythonw.exe
-scripts\daily_refresh.py auto` as "Run only when user is logged on" — the
+`YourOrgDailyRefresh` runs `analytics_env\Scripts\pythonw.exe scripts\daily_refresh.py auto` as "Run only when user is logged on" — the
 xlwings/COM steps need the interactive session, so **the laptop must be on
 and logged in** (locked is fine). A missed start (laptop off) runs when it
 next can (`StartWhenAvailable`); or just run the two manual commands.
@@ -208,6 +240,45 @@ state: `auto_refresh_state.json` in the same folder). It skips a cycle while
 `daily_refresh.py` holds the `.running` lock, so the 9:35 full run and the
 SQL task never collide. Manual `python sql\refresh.py` runs remain safe at
 any time; the auto task simply notices there is then nothing new to load.
+
+A source file modified less than 60 s ago may still be syncing through
+OneDrive. Until 2026-09-04 such a file was skipped until the next cycle, which
+silently caught the cleaned HR every HR day (prep's `clean_hr` writes it
+seconds before `sql_refresh`): SQL's `raw.hr_cleaned` / `report.hr` lagged
+until 13:00, so Morning Review's Master vs Sources and Exceptions sheets and
+the boss "HR Missing From Wave" report were built on the previous HR. Now the
+cycle waits for a young file to settle (re-stat every 10 s, up to 150 s) and
+loads it; only a file whose mtime is still moving after that is deferred. Log
+lines: `settled (waited for a young file): hr_cleaned (50s)` vs
+`deferred (still changing after 150s): ...`.
+
+### 2026-09-04 — HR moved Dr. Lastname03 to an EVP tier
+
+The 9/4 HR export carries Lastname03 in **EVP** with **SVP blank** for his whole
+org (8/31: SVP=Lastname03 on 7,522 rows; 9/4: EVP=Lastname03 on 8,025, SVP on none).
+Everything that defines "our org" keys on `SVP = Lastname03, Firstname03`
+(`add_missing_to_master.py`, `add_master_audit_notes.py`, the Master's SVP
+column written by `hr_apply`, the boss HR gap report), and the Master has no
+EVP column — so the 9/4 morning run blanked ~7,400 Master SVP cells (the HR
+change log only records Leader moves, so silently) and `add_members` found
+0 HR candidates. `clean_hr.py`'s Lastname03 tier rule now mirrors EVP = Lastname03
+into a blank SVP and prints a NOTE if a row has EVP = Lastname03 with a different
+SVP filled (a new SVP layer would need the filters revisited). Repair on the
+day: re-clean → `apply --only hr_apply` (7,453 SVP cells restored) →
+`apply --only add_members` (25 people) → `mvp_update` → `sql_post` →
+`review_refresh`. Watch for it on every HR day: `clean_hr` log line
+`Lastname03 tier rule: EVP = Lastname03 on N rows`.
+
+**Same day, MVP stub rows.** MVP User Mappings carries stub rows for some
+Locked/ServiceNow users (lowercase UID, no names/EmployeeID/title/department/
+manager — 215 on 9/4). `update_master_from_mvp.py` mirrored those blanks over
+the HR-sourced identity of 6 of the 25 just added (and VEN-JKLEIN earlier).
+Now a blank MVP value never overwrites a populated identity cell
+(`IDENTITY_KEEP_IF_MVP_BLANK`), and a new STEP 3d backfills blank
+FirstName/LastName/EmployeeID/JobTitle/Department/manager UID from the RAW HR
+export (blanks only, raw HR read only when a row needs it) and recomputes Full
+Name. Log lines: `Identity backfill: N row(s) ...` / `Rows in raw HR: ...`.
+Roles, Status, Wave and flags are still mirrored exactly.
 
 ## History note
 

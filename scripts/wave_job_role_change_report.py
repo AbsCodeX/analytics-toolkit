@@ -14,9 +14,30 @@ Monthly routine: drop the new first-week-of-month User Mappings export into
 that folder (filename must start with YYYY-MM-DD) and rerun — no code changes.
 Each file is a point-in-time snapshot of MVP as of its filename date.
 
-Leaders column joined from the OneDrive Master Wave File DATA sheet on
-UniversalID. Scope: Master users whose Leaders value is on the canonical
-leader allowlist (leader_names.CANONICAL_NAMES — same list as SQL/clean_hr).
+Snapshots vs periods — these are named on different clocks, deliberately:
+  * A SNAPSHOT is named for its own month ("August" = the roster as of Aug 2).
+  * A PERIOD (the delta between two snapshots) is named for the month the
+    window mostly falls in — the STARTING snapshot's month. Jul 5 → Aug 2 is
+    ~26 days of July against 2 of August, so it reports as July. Through
+    2026-08 periods were named for the destination snapshot, which ran every
+    column one month ahead of the activity it described.
+Every period carries its exact window; the current month gets no period until
+the following month's export closes it.
+
+Leaders column joined from the Master Wave File DATA sheet on UniversalID.
+Scope: users whose Leaders value is on the canonical leader allowlist
+(leader_names.CANONICAL_NAMES — same list as SQL/clean_hr).
+
+Scope is FROZEN per snapshot (2026-09-10, her rule: "I don't want last month's
+data to change; when a new file is added, add that to it"). The first time a
+snapshot is processed, the Master's Leaders mapping of that day is saved to
+User Mappings Monthly/_scope_ledger/leaders_<snapshot date>.csv and reused on
+every later run. A person counts in a period when the END snapshot's ledger
+has them on the allowlist, so a later move to "No Longer Rev Cycle" only
+affects periods after the move; earlier periods keep them, and they stay in
+the report under their current Leaders value ("No Longer Rev Cycle") rather
+than disappearing. Delete a ledger file only to deliberately re-scope that
+snapshot with today's Master.
 
 Output: OneDrive "Main Reports/Wave_JobRole_Change_Report.xlsx"
 (previous run auto-backed up to "Main Reports/Backups/")
@@ -59,15 +80,21 @@ MVP_DIR     = BASE / "REPORTS/Job Role Change Reports/User Mappings Monthly"
 MASTER_PATH = MASTER_WAVE_PATH
 OUT_PATH    = MAIN_REPORTS_DIR / "Wave_JobRole_Change_Report.xlsx"
 BACKUP_DIR  = MAIN_REPORTS_BACKUPS_DIR
+# Per-snapshot frozen Leaders mappings (local, next to the CSVs they scope).
+LEDGER_DIR  = MVP_DIR / "_scope_ledger"
 
 _DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
 
-def _detect_snapshots(mvp_dir: Path) -> list[tuple[str, Path]]:
+def _detect_snapshots(mvp_dir: Path) -> list[tuple[str, Path, datetime.datetime]]:
     """
     Find all *_UserMappingsData.csv files whose names start with YYYY-MM-DD,
     sort chronologically, and assign a month-name label.
     If two files fall in the same calendar month, both get a 'Mon DD' label.
+
+    Returns (label, path, snapshot_date). The label names the *snapshot* (a
+    point-in-time roster, e.g. "August" = as of Aug 2); change periods between
+    snapshots are labelled separately — see _period_month().
     """
     found = []
     for p in mvp_dir.glob("*_UserMappingsData.csv"):
@@ -97,13 +124,47 @@ def _detect_snapshots(mvp_dir: Path) -> list[tuple[str, Path]]:
             label = dt.strftime("%b %Y")
         else:
             label = dt.strftime("%B")
-        result.append((label, p))
+        result.append((label, p, dt))
     return result
 
 
 SNAPSHOTS = _detect_snapshots(MVP_DIR)
 if len(SNAPSHOTS) < 2:
     raise ValueError("At least two snapshots are required to produce a change report.")
+
+SNAP_DATES = {lbl: dt for lbl, _, dt in SNAPSHOTS}
+
+
+def _fmt_day(dt: datetime.datetime) -> str:
+    """'Jul 5' — no zero-padded day (%-d is not portable to Windows)."""
+    return f"{dt.strftime('%b')} {dt.day}"
+
+
+def _period_month(a: str) -> str:
+    """
+    Calendar month a change period belongs to = the month of the START snapshot.
+
+    Exports are pulled in the first week of each month, so the a→b delta covers
+    (say) Jul 5 → Aug 2: ~26 days of July against 2 of August. That is July's
+    activity, not August's. Labelling by the destination snapshot — as this
+    report did through 2026-08 — put every period one month later than the
+    activity it described.
+
+    MVP snapshots carry no change timestamps, so a true calendar Jul 1–31 split
+    is not derivable; the window is always reported alongside the month name.
+    """
+    return SNAP_DATES[a].strftime("%B")
+
+
+def _period_window(a: str, b: str) -> str:
+    """'Jul 5 – Aug 2' — the dates the change period actually spans."""
+    return f"{_fmt_day(SNAP_DATES[a])} – {_fmt_day(SNAP_DATES[b])}"
+
+
+def _period_window_short(a: str, b: str) -> str:
+    """'7/5-8/2' — fits the 12-char Dashboard columns without overflowing."""
+    da, db = SNAP_DATES[a], SNAP_DATES[b]
+    return f"{da.month}/{da.day}-{db.month}/{db.day}"
 
 MVP_LOAD_COLS = [
     "UniversalID", "FirstName", "LastName",
@@ -195,6 +256,39 @@ def load_leaders() -> pd.DataFrame:
     df["Leaders"]   = df["Leaders"].fillna("").str.strip()
     df["Full Name"] = df["Full Name"].fillna("").str.strip()
     return df.set_index("UniversalID")[["Full Name", "Leaders"]]
+
+
+def load_scope_ledgers(leaders_now: pd.DataFrame) -> dict[str, pd.Series]:
+    """Leaders mapping to use for each snapshot: the saved ledger if one exists,
+    otherwise today's Master (saved now so it is frozen from here on).
+    Returns {snapshot label: Series(Leaders, index=UniversalID)}."""
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    ledgers, frozen, new = {}, [], []
+    for label, _path, dt in SNAPSHOTS:
+        f = LEDGER_DIR / f"leaders_{dt:%Y-%m-%d}.csv"
+        if f.exists():
+            df = pd.read_csv(f, dtype=str, keep_default_na=False)
+            df["UniversalID"] = df["UniversalID"].str.strip().str.upper()
+            ledgers[label] = df.drop_duplicates("UniversalID").set_index("UniversalID")["Leaders"].str.strip()
+            frozen.append(label)
+        else:
+            ser = leaders_now["Leaders"].copy()
+            ser.rename_axis("UniversalID").reset_index().to_csv(f, index=False, encoding="utf-8-sig")
+            ledgers[label] = ser
+            new.append(label)
+    print(f"  Scope ledgers: {len(frozen)} frozen ({', '.join(frozen) or '-'}) | "
+          f"{len(new)} saved from today's Master ({', '.join(new) or '-'})")
+    return ledgers
+
+
+def apply_frozen_scope(combined: pd.DataFrame, ledgers: dict, labels: list) -> pd.DataFrame:
+    """Blank out a user's changes in any period whose END snapshot ledger does
+    not have them on the allowlist, so later re-scoping never rewrites history."""
+    for a, b in zip(labels, labels[1:]):
+        in_b = combined.index.isin(ledgers[b][ledgers[b].isin(LEADER_ALLOWLIST)].index)
+        combined.loc[~in_b, f"WaveChange_{a}_{b}"] = ""
+        combined.loc[~in_b, f"RoleChanged_{a}_{b}"] = False
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +393,13 @@ def role_transition_counts(df: pd.DataFrame, a: str, b: str) -> pd.DataFrame:
     return tbl.sort_values("Count", ascending=False).reset_index(drop=True)
 
 
-def describe_role_changes(role_users: pd.DataFrame, labels: list,
-                          pairs: list) -> pd.Series:
-    """Build a human-readable 'What Changed' string for each row in role_users."""
+def describe_role_changes(role_users: pd.DataFrame, pairs: list,
+                          period_month: dict) -> pd.Series:
+    """Build a human-readable 'What Changed' string for each row in role_users.
+
+    Each change is prefixed with the period's month — the month the a→b window
+    falls in, not the destination snapshot's month.
+    """
     results = []
     for _, r in role_users.iterrows():
         parts = []
@@ -316,7 +414,7 @@ def describe_role_changes(role_users: pd.DataFrame, labels: list,
                 if va != vb:
                     slot_changes.append(f"{va or '(None)'} → {vb or '(None)'}")
             if slot_changes:
-                parts.append(f"{b}: " + "; ".join(slot_changes))
+                parts.append(f"{period_month[f'{a}_{b}']}: " + "; ".join(slot_changes))
         results.append(" | ".join(parts))
     return pd.Series(results, index=role_users.index)
 
@@ -438,9 +536,9 @@ def main():
 
     # -- Load snapshots --------------------------------------------------------
     print("Loading MVP snapshots...")
-    labels         = [lbl for lbl, _ in SNAPSHOTS]
+    labels         = [lbl for lbl, _, _ in SNAPSHOTS]
     snapshots_dict = {}
-    for label, path in SNAPSHOTS:
+    for label, path, _dt in SNAPSHOTS:
         snapshots_dict[label] = load_snapshot(path, label)
         print(f"  {label:8s}: {len(snapshots_dict[label]):,} unique UIDs  ({path.name})")
 
@@ -448,18 +546,54 @@ def main():
     print("Loading Leaders from Master Wave File...")
     leaders = load_leaders()
     print(f"  {len(leaders):,} users in Master")
+    ledgers = load_scope_ledgers(leaders)
+    # Ever in scope = on the allowlist in ANY snapshot's ledger. People who
+    # later left Rev Cycle stay in the report under their current Leaders value.
+    ever_scope = set()
+    for ser in ledgers.values():
+        ever_scope |= set(ser[ser.isin(LEADER_ALLOWLIST)].index)
+    # Users dropped from today's Master but present in an older ledger keep
+    # their last ledger Leaders value so the inner join does not lose them.
+    missing = [u for u in ever_scope if u not in leaders.index]
+    if missing:
+        last = {}
+        for ser in ledgers.values():
+            for u in missing:
+                if u in ser.index:
+                    last[u] = ser[u]
+        extra = pd.DataFrame({"Full Name": "", "Leaders": pd.Series(last)})
+        extra.index.name = "UniversalID"
+        leaders = pd.concat([leaders, extra])
+        print(f"  {len(missing):,} user(s) no longer on the Master kept from older ledgers")
 
     # -- Build combined dataset ------------------------------------------------
     print("Building combined dataset...")
     combined = build_combined(snapshots_dict, leaders)
     combined = add_change_cols(combined, labels)
-    in_scope = combined[combined["Leaders"].isin(LEADER_ALLOWLIST)].copy()
-    print(f"  {len(combined):,} in Master  |  {len(in_scope):,} in scope")
+    combined = apply_frozen_scope(combined, ledgers, labels)
+    in_scope = combined[combined.index.isin(ever_scope)].copy()
+    left_rc_n = int((~in_scope["Leaders"].isin(LEADER_ALLOWLIST)).sum())
+    print(f"  {len(combined):,} in Master  |  {len(in_scope):,} in scope "
+          f"(of which {left_rc_n:,} since left Rev Cycle, kept)")
 
     pairs         = [(labels[i], labels[i + 1]) for i in range(len(labels) - 1)]
     period_keys   = [f"{a}_{b}" for a, b in pairs]
-    # Period label = destination snapshot (the "as of" month for the change)
-    period_labels = {f"{a}_{b}": b for a, b in pairs}
+
+    # Period label = the month the change window actually falls in (the START
+    # snapshot's month) plus the exact window. Snapshots land in the first week
+    # of a month, so Jul 5 → Aug 2 is July's activity — labelling it by the
+    # destination snapshot ("August") ran every period a month ahead of itself.
+    period_month  = {f"{a}_{b}": _period_month(a)     for a, b in pairs}
+    period_window = {f"{a}_{b}": _period_window(a, b) for a, b in pairs}
+    period_win_sh = {f"{a}_{b}": _period_window_short(a, b) for a, b in pairs}
+    period_labels = {k: f"{period_month[k]}  ({period_window[k]})" for k in period_keys}
+    # Compact form for chart category axes — month alone unless it repeats
+    # (two snapshots inside one calendar month), in which case add the window.
+    _month_counts = Counter(period_month.values())
+    period_chart  = {
+        k: (v if _month_counts[v] == 1 else f"{v} ({period_window[k]})")
+        for k, v in period_month.items()
+    }
 
     # Departed / wave-exception: use most recent snapshot the user appears in
     def _latest_flag(r, col_prefix):
@@ -498,7 +632,7 @@ def main():
           f"New: {len(new_users):,}  |  Departed: {departed_n:,}")
 
     # Precompute "What Changed" for Job Role Changes sheet
-    role_what_changed = describe_role_changes(role_users, labels, pairs)
+    role_what_changed = describe_role_changes(role_users, pairs, period_month)
 
     # -- Chart / dashboard data ------------------------------------------------
     wave_ch_data = {key: int((in_scope[f"WaveChange_{key}"] != "").sum()) for key in period_keys}
@@ -590,7 +724,7 @@ def main():
     ws_cd.write(0, HC,     "Period")
     ws_cd.write(0, HC + 1, "Wave Changes")
     for i, key in enumerate(period_keys):
-        ws_cd.write(1 + i, HC,     period_labels[key])
+        ws_cd.write(1 + i, HC,     period_chart[key])
         ws_cd.write(1 + i, HC + 1, wave_ch_data[key])
 
     # T2: role changes by period
@@ -598,7 +732,7 @@ def main():
     ws_cd.write(t2_base, HC,     "Period")
     ws_cd.write(t2_base, HC + 1, "Role Changes")
     for i, key in enumerate(period_keys):
-        ws_cd.write(t2_base + 1 + i, HC,     period_labels[key])
+        ws_cd.write(t2_base + 1 + i, HC,     period_chart[key])
         ws_cd.write(t2_base + 1 + i, HC + 1, role_ch_data[key])
 
     # T3: new additions by first snapshot
@@ -624,7 +758,7 @@ def main():
     for wi, wn in enumerate(wave_names):
         ws_cd.write(t5_base, HC + 1 + wi, f"→ {wn}")
     for i, key in enumerate(period_keys):
-        ws_cd.write(t5_base + 1 + i, HC, period_labels[key])
+        ws_cd.write(t5_base + 1 + i, HC, period_chart[key])
         for wi, wn in enumerate(wave_names):
             ws_cd.write(t5_base + 1 + i, HC + 1 + wi, wave_dest_data[key][wn])
 
@@ -745,15 +879,19 @@ def main():
 
     # Section: WAVE DESTINATIONS BY PERIOD
     ws_d.merge_range(R_SEC_DEST, 1, R_SEC_DEST, 10,
-                     "WAVE DESTINATIONS BY PERIOD", fmt["dash_section"])
-    ws_d.write(R_DEST_HDR, 1, "Period", fmt["dash_tbl_hdr"])
+                     "WAVE DESTINATIONS BY PERIOD   "
+                     "(period = the month the change window falls in)",
+                     fmt["dash_section"])
+    ws_d.write(R_DEST_HDR, 1, "Period",  fmt["dash_tbl_hdr"])
+    ws_d.write(R_DEST_HDR, 2, "Window",  fmt["dash_tbl_hdr"])
     for wi, wn in enumerate(wave_names):
-        ws_d.write(R_DEST_HDR, 2 + wi, f"→ {wn}", fmt["dash_tbl_hdr"])
+        ws_d.write(R_DEST_HDR, 3 + wi, f"→ {wn}", fmt["dash_tbl_hdr"])
     for i, key in enumerate(period_keys):
         row = R_DEST_FIRST + i
-        ws_d.write(row, 1, period_labels[key], fmt["tbl_dat"])
+        ws_d.write(row, 1, period_month[key],  fmt["tbl_dat"])
+        ws_d.write(row, 2, period_win_sh[key], fmt["tbl_dat"])
         for wi, wn in enumerate(wave_names):
-            ws_d.write(row, 2 + wi, wave_dest_data[key][wn], fmt["tbl_num"])
+            ws_d.write(row, 3 + wi, wave_dest_data[key][wn], fmt["tbl_num"])
 
     # Divider 3
     for c in range(1, 11):
@@ -908,18 +1046,26 @@ def main():
 
     row = 4
     row = section_header(ws1, row, "SNAPSHOT SIZES", fmt["section"], 3)
+    ws1.write(row, 0, "Snapshot",  fmt["subhdr"])
+    ws1.write(row, 1, "Users",     fmt["subhdr"])
+    ws1.write(row, 2, "Pulled",    fmt["subhdr"]); row += 1
     for lbl in labels:
         ws1.write(row, 0, lbl, fmt["bold"])
         ws1.write(row, 1, int(in_scope[f"In_{lbl}"].sum()), fmt["num"])
+        ws1.write(row, 2, SNAP_DATES[lbl].strftime("%m/%d/%Y"), fmt["data"])
         row += 1
     ws1.write(row, 0, "In Master Wave File",              fmt["bold"])
     ws1.write(row, 1, len(combined),                      fmt["num"]); row += 1
     ws1.write(row, 0, "In Scope (16-leader allowlist)",   fmt["bold"])
     ws1.write(row, 1, len(in_scope),                      fmt["num"]); row += 1
+    ws1.write(row, 0, "  of which since left Rev Cycle (kept)", fmt["data"])
+    ws1.write(row, 1, left_rc_n,                          fmt["num"]); row += 1
     ws1.write(row, 0, "Departed Users in Scope (latest)", fmt["bold"])
     ws1.write(row, 1, departed_n,                         fmt["num"]); row += 3
 
-    row = section_header(ws1, row, "WAVE MOVEMENTS  (in-scope users only)", fmt["section"], 3)
+    row = section_header(ws1, row,
+        "WAVE MOVEMENTS  (in-scope users only — period = month the window falls in)",
+        fmt["section"], 3)
     for key in period_keys:
         ws1.write(row, 0, period_labels[key], fmt["subhdr"])
         ws1.write(row, 1, "Count",            fmt["subhdr"])
@@ -976,6 +1122,13 @@ def main():
     row = section_header(ws1, row, "DEFINITIONS", fmt["section"], 4)
     defs = [
         ("In Scope",       "Users in Master Wave File whose Leaders column is in the 16-leader allowlist."),
+        ("Snapshot",       "A point-in-time MVP export — the roster as of its Pulled date above."),
+        ("Period",         "Change window between two consecutive snapshots, named for the month it mostly "
+                           "falls in (the starting snapshot's month). Exact window always shown alongside."),
+        ("Why the window",  "Exports are pulled in the first week, so Jul 5 – Aug 2 is ~26 days of July vs "
+                           "2 of August — reported as July, not August."),
+        ("Current month",  "Has no period until next month's export lands and closes the window. "
+                           "Snapshots carry no timestamps, so windows cannot be split by calendar day."),
         ("New Addition",   f"User present in a later snapshot but absent from {labels[0]}."),
         ("Wave Change",    "GoLiveWave differs between two consecutive monthly snapshots."),
         ("Role Change",    "Any Job Role 1-4 (IndividualCategoryUpdate1-4Name) differs between consecutive snapshots."),
@@ -1029,7 +1182,7 @@ def main():
                          fmt["section"], len(period_keys) + 1)
     ws2.write(row, 0, "Leader", fmt["header"])
     for i, key in enumerate(period_keys):
-        ws2.write(row, i + 1, period_labels[key], fmt["header"])
+        ws2.write(row, i + 1, f"{period_month[key]} ({period_win_sh[key]})", fmt["header"])
     row += 1
     for leader in sorted(LEADER_ALLOWLIST):
         sub = in_scope[in_scope["Leaders"] == leader]
@@ -1083,7 +1236,7 @@ def main():
     headers3 = (
         ["Universal ID", "Team Member", "Leaders"]
         + [f"Wave ({l})" for l in labels]
-        + [f"Wave Change as of {period_labels[f'{a}_{b}']}" for a, b in pairs]
+        + [f"Wave Chg — {period_labels[f'{a}_{b}']}" for a, b in pairs]
         + ["Departed", "Wave Exception"]
     )
     row = 2
@@ -1125,7 +1278,7 @@ def main():
     ws4.set_column(1, 1, 32)
     ws4.set_column(2, 2, 28)
     ws4.set_column(3, 3 + n_role_cols - 1, 26)
-    ws4.set_column(chg_col_start, what_col - 1, 10)
+    ws4.set_column(chg_col_start, what_col - 1, 12)
     ws4.set_column(what_col, what_col, 60)
     ws4.set_column(dep_col,  dep_col + 1, 14)
     ws4.hide_gridlines(2)
@@ -1137,7 +1290,8 @@ def main():
     headers4 = (
         ["Universal ID", "Team Member", "Leaders"]
         + [f"{lbl} ({snap})" for lbl in JOB_ROLE_LABELS for snap in labels]
-        + [f"Role Chg as of {period_labels[f'{a}_{b}']}" for a, b in pairs]
+        + [f"Role Chg — {period_month[f'{a}_{b}']} ({period_win_sh[f'{a}_{b}']})"
+           for a, b in pairs]
         + ["What Changed", "Departed", "Wave Exception"]
     )
     row = 2

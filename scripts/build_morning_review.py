@@ -14,9 +14,11 @@ what changed, what needs review, and where every file lives.
 Sheets (stable name Morning Review.xlsx, overwritten each run; dated copy in
 morning_review\\archive\\<YYYY-MM>\\):
 
-  Start Here            run status + errors + source freshness + rows to review
+  Start Here            run status + errors + export flags + rows to review
   Today's Run           every pipeline step today: OK / FAILED / SKIPPED + duration
   Files Updated         each deliverable, updated-today flag, timestamp, link
+  Export Audit          every export feed end-to-end: on disk, fresh, loaded in
+                        SQL, row counts sane (export_audit.py; OK / WARN / FAIL)
   HR Leader Changes     preview CSV from review_hr_leader_changes.py
   Master vs Sources     SQL report.master_vs_sources (only rows with a Differs flag)
   Exceptions            SQL report.exceptions (in-scope, missing from Epic/HR)
@@ -57,22 +59,22 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "sql"))
 
 import activity_log                          # noqa: E402
+import export_audit                          # noqa: E402
 import onedrive_paths as op                  # noqa: E402
 from refresh import CONN                     # noqa: E402
 from report_xlsx import write_formatted_workbook      # noqa: E402
 from sqlalchemy import create_engine         # noqa: E402
 
-# review_hr_leader_changes.py writes its preview CSV to the morning_review
-# folder on OneDrive (moved from the local scripts/ folder 2026-07-07).
-HR_PREVIEW_CSV = op.MORNING_REVIEW_DIR / "hr_leader_changes_preview.csv"
+# review_hr_leader_changes.py writes its preview CSV next to Morning Review
+# in Main Reports (moved from the retired morning_review folder 2026-07-30).
+HR_PREVIEW_CSV = op.HR_PREVIEW_CSV_PATH
 
 DAILY_REFRESH_LOG_DIR = op.RUNLOGS_DIR / "daily_refresh"
 MASTER_REPORTS_DIR = op.MAIN_REPORTS_DIR
 TRACKER_PATH = MASTER_REPORTS_DIR / "RCM Training Tracker.xlsx"
 DAILY_LOG_PATH = MASTER_REPORTS_DIR / "RCM Training Daily Log.xlsx"
-NEW_MEMBERS_DIR = op.ONEDRIVE_ROOT / "data" / "reports" / "new_members_added"
-EXEC_BRIEF_PATH = ROOT / "REPORTS" / "RCM W3 Executive Brief.html"
-W3_TRACKER_DIR = op.ONEDRIVE_ROOT / "data" / "reports" / "w3_tracker"
+NEW_MEMBERS_DIR = op.NEW_MEMBERS_DIR      # local since 2026-08-11 (follows the Master)
+EXEC_BRIEF_PATH = op.DASHBOARDS_DIR / "RCM W3 Executive Brief.html"
 
 # User sheets carried forward across rebuilds (values only).
 PERSONAL_PREFIX = "my "
@@ -117,6 +119,10 @@ SHEET_GUIDE = {
     "Activity Log":
         "Last 7 days of individual script runs (newest first), from "
         "activity_log.xlsx.",
+    "Export Audit":
+        "Every export feed checked end-to-end: file on disk, dropped on "
+        "schedule, loaded into SQL, row counts sane, Enterprise under the 1M "
+        "cap. WARN/FAIL rows need a look; OK means current and loaded.",
     "Directory":
         "Persistent map of everything — reports, raw drops, backups, logs. "
         "Links are clickable. Backup rows explain how to revert.",
@@ -139,22 +145,19 @@ def _sql(engine, sql: str, empty_note: str) -> pd.DataFrame:
     return df if len(df) else _note(empty_note)
 
 
-def _freshness_rows() -> list[dict]:
-    sources = [
-        ("HR.xlsx (raw)", op.RAW_HR_PATH),
-        ("MVP User Mappings", op.RAW_MVP_USER_MAPPINGS),
-        ("Epic Team Member Lookup", op.RAW_EPIC_TM_DIR / "Epic Team Member Lookup.xlsx"),
-        ("Master Wave File", op.MASTER_WAVE_PATH),
-    ]
-    rows = []
-    for label, path in sources:
-        if path.exists():
-            m = datetime.fromtimestamp(path.stat().st_mtime)
-            age_days = (datetime.now() - m).days
-            rows.append({"Item": f"Source: {label}",
-                         "Detail": f"updated {m:%Y-%m-%d %H:%M} ({age_days}d ago)"})
-        else:
-            rows.append({"Item": f"Source: {label}", "Detail": "MISSING"})
+def _audit_start_rows(audit_df: pd.DataFrame) -> list[dict]:
+    """Start Here lines from the export audit: a one-line summary, plus one
+    line per flagged feed so problems are visible without changing sheets."""
+    flagged = audit_df[audit_df["Status"] != "OK"]
+    if flagged.empty:
+        summary = f"All {len(audit_df)} feeds OK — on disk, fresh, and loaded"
+    else:
+        summary = (f"{len(flagged)} of {len(audit_df)} feeds flagged "
+                   "— see Export Audit sheet")
+    rows = [{"Item": "Export audit", "Detail": summary}]
+    for r in flagged.itertuples():
+        rows.append({"Item": f"Export {r.Status}",
+                     "Detail": f"{r.Feed}: {r.Detail}"})
     return rows
 
 
@@ -339,8 +342,8 @@ def _directory() -> pd.DataFrame:
          op.GAP_REPORTS_DIR),
         ("Daily outputs", "W3 Executive Brief", "Flagship HTML brief (10 AM task rebuilds it).",
          EXEC_BRIEF_PATH),
-        ("Daily outputs", "W3 tracker folder", "Daily W3 dashboards (10 AM task).",
-         W3_TRACKER_DIR),
+        ("Daily outputs", "Dashboards folder", "All HTML dashboards (exec brief + variants).",
+         op.DASHBOARDS_DIR),
         ("Daily outputs", "New members added", "One CSV per day the apply appended people.",
          NEW_MEMBERS_DIR),
         ("Daily outputs", "SQL pulls", "Ad-hoc query exports (sql\\query.py --excel).",
@@ -366,7 +369,8 @@ def _directory() -> pd.DataFrame:
         ("Backups / revert", "Master + report backups", "Daily .bak.<date> copies, monthly folders. "
          "REVERT = close Excel, copy the .bak over the live file.",
          op.MASTER_ARCHIVE_DIR),
-        ("Backups / revert", "Tracker + Daily Log backups", "Daily pre-rebuild .bak.<date> copies. "
+        ("Backups / revert", "Tracker + Daily Log + Morning Review backups",
+         "Daily pre-rebuild .bak.<date> copies + dated Morning Review archive. "
          "REVERT = copy the .bak over the live file.",
          op.MAIN_REPORTS_BACKUPS_DIR),
         ("Backups / revert", "Master DATA snapshots", "Values-only DATA sheet after every edit "
@@ -374,8 +378,6 @@ def _directory() -> pd.DataFrame:
          op.WAVE_REPOSITORY_DIR),
         ("Backups / revert", "Team File dated copies", "One per publish.",
          op.WAVE_DISTRIBUTION_DIR),
-        ("Backups / revert", "Morning Review archive", "Dated copy of this workbook per build.",
-         op.MORNING_REVIEW_DIR / "archive"),
         ("Backups / revert", "SQL history snapshots", "Dated CSV per history table per day "
          "(backload_history rebuilds SQL from these).",
          op.HISTORY_SNAPSHOTS_DIR),
@@ -441,7 +443,7 @@ def _save_with_retry(sheets: dict, link_cols: dict, stamps: dict) -> Path:
             if attempt < 2:
                 print("  Morning Review.xlsx is open in Excel — retrying in 15s...")
                 time.sleep(15)
-    fallback = op.MORNING_REVIEW_DIR / "Morning Review (LATEST - close the other copy).xlsx"
+    fallback = op.MAIN_REPORTS_DIR / "Morning Review (LATEST - close the other copy).xlsx"
     write_formatted_workbook(sheets, fallback, link_cols, stamps)
     print(f"WARNING: Morning Review.xlsx was open in Excel; fresh copy saved as "
           f"{fallback.name}. Close the open copy — tomorrow's run will overwrite "
@@ -511,6 +513,10 @@ def main() -> None:
 
         files_df = _files_updated()
         directory_df = _directory()
+        try:
+            audit_df = export_audit.audit(engine)
+        except Exception as e:   # audit must never sink the review build
+            audit_df = _note(f"Export audit failed to run: {e}")
 
         # ----- Start Here: the summary hub -----
         total = sum(0 if _is_note(df) else len(df) for df in sheets.values())
@@ -536,7 +542,7 @@ def main() -> None:
                           "Detail": ", ".join(not_updated) + " — see Files Updated"})
         start.append({"Item": "Revert point",
                       "Detail": (f"Master backup: {today_bak.name} (in "
-                                 f"data\\reports\\archive\\{date.today():%Y-%m}) — "
+                                 f"{op.MASTER_ARCHIVE_DIR}\\{date.today():%Y-%m}) — "
                                  "copy over the live file to roll back"
                                  if today_bak.exists()
                                  else "No Master backup taken today (no Master "
@@ -544,9 +550,11 @@ def main() -> None:
         start.append({"Item": "Your pages",
                       "Detail": "Sheets named 'My ...' are carried forward on "
                                 "every rebuild — use them for notes/references."})
-        start += _freshness_rows()
-        for name in ["Today's Run", "Files Updated", *sheets.keys(),
-                     "Run History", "Activity Log", "Directory"]:
+        start += (_audit_start_rows(audit_df) if not _is_note(audit_df)
+                  else [{"Item": "Export audit",
+                         "Detail": str(audit_df.at[0, "Note"])}])
+        for name in ["Today's Run", "Files Updated", "Export Audit",
+                     *sheets.keys(), "Run History", "Activity Log", "Directory"]:
             if name in sheets:
                 df = sheets[name]
                 n = 0 if _is_note(df) else len(df)
@@ -559,6 +567,7 @@ def main() -> None:
         ordered = {"Start Here": pd.DataFrame(start).fillna(""),
                    "Today's Run": run_df,
                    "Files Updated": files_df,
+                   "Export Audit": audit_df,
                    **sheets,
                    "Run History": _run_history(),
                    "Activity Log": _activity_log_week(),
@@ -572,10 +581,10 @@ def main() -> None:
 
         link_cols = {"Files Updated": "Location", "Directory": "Location"}
 
-        op.MORNING_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        op.MAIN_REPORTS_BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
         saved_to = _save_with_retry(ordered, link_cols, stamps)
         op.write_dated_copy(saved_to,
-                            op.month_subdir(op.MORNING_REVIEW_DIR / "archive"),
+                            op.month_subdir(op.MAIN_REPORTS_BACKUPS_DIR),
                             "morning_review")
 
         print(f"Morning Review built: {total} total rows to review, "

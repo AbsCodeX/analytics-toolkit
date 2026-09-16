@@ -43,9 +43,12 @@ Rules:
   - Badge Buddies updated from IsEpicSuperUser (string -> bool)
   - Full Name computed as "LastName, FirstName MI" for every row
   - Training Preference auto-filled when blank (Remote/Onsite rules)
-  - Training Needed: set to "No" ONLY when departed/inactive OR Job Role 1 is
-    on the no-training list (wave_reference_lists.xlsx, 'no_training_job_roles'
-    sheet — the shared editable source; REF!I is display-only fallback).
+  - Training Needed: set to "No" ONLY when departed/inactive OR EVERY populated
+    Job Role 1-4 is on the no-training list (wave_reference_lists.xlsx,
+    'no_training_job_roles' sheet — the shared editable source; REF!I is
+    display-only fallback). One qualifying role anywhere in Job Role 1-4 keeps
+    the person trainable (her rule 2026-09-10: HIM scanners with an ROI /
+    Deficiency Analyst second role were being forced to No by Job Role 1 alone).
     Blank cells are filled with "Yes".
     Existing Yes/No values are never overwritten otherwise. The old "Why
     reason → No" override (LOA / Terminated / View Only) is no longer applied.
@@ -74,6 +77,13 @@ Rules:
     overwrites a populated leader cell. Leaders is recomputed only when its
     cell is blank (VP > AVP > SVP, with No Longer Rev Cycle fallback and the
     Lastname09/Lastname02 UID overrides).
+  - Identity vs MVP stub rows (2026-09-04): MVP carries stub rows for some
+    Locked/ServiceNow users (no names/EmployeeID/title/department/manager).
+    A BLANK MVP value never overwrites a populated identity cell
+    (IDENTITY_KEEP_IF_MVP_BLANK); afterwards any row still missing
+    FirstName/LastName is backfilled — blanks only — from the RAW HR export
+    (HR_IDENTITY_MAP + MI) and Full Name recomputed. Raw HR is read only
+    when a row needs it.
   - Excel Table1 ref + sheet dimension updated to actual row count
   - DASHBOARD C3 updated with today's run date (MM/DD/YYYY)
   - Run Log row appended inside the Master, plus external master_runlog.xlsx
@@ -220,6 +230,32 @@ COL_MAP = {
     "GoLiveWave":                   "GoLiveWave",
     "IsDepartedInactive?":          "IsDepartedInactive",
     "Badge Buddies":                "IsEpicSuperUser",
+}
+
+# 2026-09-04: MVP User Mappings carries STUB rows for some Locked/ServiceNow
+# users — lowercase UID, no names, EmployeeID, department, title or manager
+# (215 such rows in the 9/4 export). Mirroring those blanks wiped the
+# HR-sourced identity of 6 people add_missing_to_master.py had appended the
+# same day (and VEN-JKLEIN before that). For these identity columns a BLANK
+# MVP value keeps whatever the Master already holds; a populated MVP value
+# still overwrites exactly as before. Roles / Status / Wave / flags remain
+# mirror-exactly — MVP is their authority and a blank there is meaningful.
+IDENTITY_KEEP_IF_MVP_BLANK = frozenset({
+    "EmployeeID", "FirstName", "MI", "LastName", "DepartmentLocation", "JobTitle",
+    "BusinessUnit", "ValidatingManagerUniversalID", "ValidatingManagerFirstName",
+    "ValidatingManagerLastName", "HRManagerUniversalID",
+})
+
+# Identity backfill (fill-blanks-only) from the RAW HR export, for rows whose
+# FirstName / LastName are blank after the MVP pass (MVP stub or not in MVP).
+# Raw HR field -> Master column. Same fields add_missing_to_master.py seeds.
+HR_IDENTITY_MAP = {
+    "FirstName":          "FirstName",
+    "LastName":           "LastName",
+    "EmployeeID":         "EmployeeID",
+    "JobTitle":           "JobTitle",
+    "Department Name":    "DepartmentLocation",
+    "ManagerUniversalID": "ValidatingManagerUniversalID",
 }
 
 REQUIRED_COLS = (
@@ -531,6 +567,97 @@ def backfill_blanks_from_hr(wb: SurgicalWorkbook, hr: dict) -> dict:
     return counts
 
 
+def _hr_text(v) -> str | None:
+    """Raw-HR cell -> stripped text, or None for blank / NaN / 'nan'."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none", "nan, nan"):
+        return None
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def rows_missing_identity(wb: SurgicalWorkbook) -> list[tuple[int, str]]:
+    """(row, UID) for every data row with a UID but a blank FirstName or LastName."""
+    uid_col, f_col, l_col = wb.col_of["UniversalID"], wb.col_of["FirstName"], wb.col_of["LastName"]
+    out = []
+    for r in wb.rows:
+        rn = r[0]
+        if rn == 1:
+            continue
+        uid = _hr_text(wb.get_value(rn, uid_col))
+        if not uid:
+            continue
+        if _is_blank(wb.get_value(rn, f_col)) or _is_blank(wb.get_value(rn, l_col)):
+            out.append((rn, uid.upper()))
+    return out
+
+
+def load_hr_raw_identity(path: Path, uids: set[str]) -> dict:
+    """Raw HR.xlsx rows for the given UIDs only, keyed by UID.upper().
+
+    Loaded lazily (pandas + calamine, ~15 s) and only when some row needs it —
+    the file is 146k rows x 67 cols, so it is not read on a clean day.
+    """
+    import pandas as pd  # noqa: PLC0415 — deliberate lazy import (see above)
+    with pd.ExcelFile(path, engine="calamine") as xl:
+        df = pd.read_excel(xl, sheet_name=xl.sheet_names[0], dtype=str)
+    if "UniversalID" not in df.columns:
+        raise KeyError("raw HR sheet is missing 'UniversalID'")
+    df["_UID"] = df["UniversalID"].map(_hr_text).str.upper()
+    df = df[df["_UID"].isin(uids)].drop_duplicates(subset=["_UID"])
+    return {row["_UID"]: row for _, row in df.iterrows()}
+
+
+def backfill_identity_from_raw_hr(wb: SurgicalWorkbook, needing: list[tuple[int, str]],
+                                  hr_raw: dict) -> dict:
+    """
+    Fill BLANK identity cells (HR_IDENTITY_MAP + MI from MiddleName) from raw
+    HR for the rows in `needing`, then recompute Full Name where it is blank.
+    Never overwrites a populated cell. Returns counters dict.
+    """
+    counts = {"rows_needing": len(needing), "rows_in_hr": 0, "rows_touched": 0, "cells": 0}
+    fn_col, mi_col = wb.col_of["Full Name"], wb.col_of["MI"]
+    f_col, l_col = wb.col_of["FirstName"], wb.col_of["LastName"]
+    for rn, uid in needing:
+        h = hr_raw.get(uid)
+        if h is None:
+            continue
+        counts["rows_in_hr"] += 1
+        changed = False
+        for hr_field, master_col in HR_IDENTITY_MAP.items():
+            col = wb.col_of.get(master_col)
+            if col is None or not _is_blank(wb.get_value(rn, col)):
+                continue
+            v = _hr_text(h.get(hr_field))
+            if v is None:
+                continue
+            if master_col == "EmployeeID" and v.isdigit():
+                v = int(v)
+            wb.set_value(rn, col, v)
+            counts["cells"] += 1
+            changed = True
+        mid = _hr_text(h.get("MiddleName"))
+        if mid and _is_blank(wb.get_value(rn, mi_col)):
+            wb.set_value(rn, mi_col, mid[0] + ".")
+            counts["cells"] += 1
+            changed = True
+        if _is_blank(wb.get_value(rn, fn_col)):
+            first = _hr_text(wb.get_value(rn, f_col)) or ""
+            last = _hr_text(wb.get_value(rn, l_col)) or ""
+            mi = _hr_text(wb.get_value(rn, mi_col)) or ""
+            if first or last:
+                given = f"{first} {mi}".strip() if mi else first
+                wb.set_value(rn, fn_col, f"{last}, {given}" if last else given)
+                counts["cells"] += 1
+                changed = True
+        if changed:
+            counts["rows_touched"] += 1
+    return counts
+
+
 def load_no_training_roles(wb: SurgicalWorkbook) -> set:
     """No-training Job Roles (lowercased) — read from the reference workbook
     (data/references/wave_reference_lists.xlsx, 'no_training_job_roles' sheet),
@@ -837,6 +964,7 @@ def main():
     tn_col    = wb.col_of["Training Needed (Yes/No)"]
     fn_col    = wb.col_of["Full Name"]
     jr1_col   = wb.col_of["Job Role 1"]
+    jr_cols   = [wb.col_of[h] for h in TRACKED_JOB_ROLES if h in wb.col_of]
     dep_col   = wb.col_of["IsDepartedInactive?"]
     fname_col = wb.col_of["FirstName"]
     mi_col    = wb.col_of["MI"]
@@ -963,6 +1091,9 @@ def main():
                             val = clean_val(s)
                 else:
                     val = clean_val(raw)
+                if (val is None and master_col in IDENTITY_KEEP_IF_MVP_BLANK
+                        and not _is_blank(wb.get_value(rn, col))):
+                    continue  # MVP stub row: keep the populated identity cell
                 wb.set_value(rn, col, val)
 
             existing_note = wb.get_value(rn, notes_col)
@@ -999,15 +1130,18 @@ def main():
             new_fn = None
         wb.set_value(rn, fn_col, new_fn)
 
-        # Training Needed — set "No" only for departed/inactive or a Job Role
-        # on the no-training list. Otherwise fill blanks with "Yes"; never
-        # overwrite an existing Yes/No value.
+        # Training Needed — set "No" only for departed/inactive, or when EVERY
+        # populated Job Role 1-4 is on the no-training list (a single trainable
+        # role anywhere keeps the person trainable — 2026-09-10). Otherwise
+        # fill blanks with "Yes"; never overwrite an existing Yes/No value.
         departed_raw = wb.get_value(rn, dep_col)
         is_departed  = (departed_raw is True) or (
             convert_bool(str(departed_raw)) is True
             if departed_raw is not None else False
         )
-        jr1_lower = str(wb.get_value(rn, jr1_col) or "").strip().lower()
+        jr_vals = [str(wb.get_value(rn, c) or "").strip().lower() for c in jr_cols]
+        jr_vals = [v for v in jr_vals if v]
+        all_roles_no_training = bool(jr_vals) and all(v in no_training_roles for v in jr_vals)
         current_tn = str(wb.get_value(rn, tn_col) or "").strip()
 
         if is_departed and not was_departed:
@@ -1019,7 +1153,7 @@ def main():
             wb.set_value(rn, tn_col, "No")
             tn_set_no += 1
             tn_departed += 1
-        elif jr1_lower and jr1_lower in no_training_roles:
+        elif all_roles_no_training:
             wb.set_value(rn, tn_col, "No")
             tn_set_no += 1
             tn_job_role += 1
@@ -1134,6 +1268,30 @@ def main():
                          "AVP", "VP", "SVP", "Leaders"):
                 if hr_counts[name]:
                     print(f"    → {name}: {hr_counts[name]:,} filled")
+
+    # -- STEP 3d: identity backfill from RAW HR — fill-blanks-only ----------
+    # 2026-09-04: rows whose FirstName/LastName are blank after the MVP pass
+    # (MVP stub rows, or people not in MVP at all) get names / EmployeeID /
+    # JobTitle / Department / manager UID from the raw HR export, then Full
+    # Name is recomputed. Never overwrites a populated cell. Raw HR is only
+    # read when at least one row needs it.
+    id_counts = {"rows_needing": 0, "rows_in_hr": 0, "rows_touched": 0, "cells": 0}
+    needing = rows_missing_identity(wb)
+    if needing:
+        raw_hr_path = onedrive_paths.RAW_HR_PATH
+        print(f"Identity backfill: {len(needing)} row(s) with blank FirstName/LastName "
+              f"— loading raw HR ({raw_hr_path.name})...")
+        try:
+            hr_raw = load_hr_raw_identity(raw_hr_path, {u for _, u in needing})
+            id_counts = backfill_identity_from_raw_hr(wb, needing, hr_raw)
+            print(f"  Rows in raw HR: {id_counts['rows_in_hr']} | rows touched: "
+                  f"{id_counts['rows_touched']} | cells filled: {id_counts['cells']}")
+            still = [u for _, u in needing if u not in hr_raw]
+            if still:
+                print(f"  Still blank (not in raw HR either): {', '.join(still[:20])}"
+                      + (" ..." if len(still) > 20 else ""))
+        except Exception as e:
+            print(f"  WARNING: identity backfill skipped ({e}).")
 
     # -- STEP 4: Table1 ref + dimension + DASHBOARD date --------------------
     wb.sync_table_and_dimension()

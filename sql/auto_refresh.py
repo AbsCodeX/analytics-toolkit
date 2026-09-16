@@ -18,10 +18,12 @@ What it does each cycle:
      uses) against the last successfully-loaded state in
      data\\runlogs\\daily_refresh\\auto_refresh_state.json.
   3. Loads ONLY the changed sources by calling refresh.py's own loaders
-     in-process. A file modified less than STABLE_SECONDS ago is deferred to
-     the next cycle (it may still be syncing through OneDrive). State is
-     updated per source only after a SUCCESSFUL load, so locked/failed files
-     retry automatically next cycle.
+     in-process. A file modified less than STABLE_SECONDS ago is WAITED ON
+     (re-stat every STABLE_POLL s, up to STABLE_WAIT_MAX s) until it has
+     settled, then loaded in the same cycle; only a file still changing after
+     that is deferred to the next cycle (it may still be syncing through
+     OneDrive). State is updated per source only after a SUCCESSFUL load, so
+     locked/failed files retry automatically next cycle.
   4. If sql\\3_report_views.sql or sql\\4_dimensions.sql changed on disk,
      re-applies them via sqlcmd (before the snapshot — snapshot reads
      report.roster).
@@ -72,6 +74,18 @@ OWN_LOCK = LOCK_DIR / ".auto_refresh_running"
 DAILY_LOCK_STALE_HOURS = 12                         # match daily_refresh.py
 OWN_LOCK_STALE_MINUTES = 60
 STABLE_SECONDS = 60      # a file younger than this may still be OneDrive-syncing
+# 2026-09-04: a young file is no longer skipped outright — the cycle WAITS for
+# it to settle (every file >= STABLE_SECONDS old, i.e. its mtime stopped
+# moving), up to STABLE_WAIT_MAX seconds, and only then defers. Before this,
+# prep's clean_hr step wrote HR_cleaned_<date>.xlsx seconds before sql_refresh
+# ran, so the fresh cleaned HR was deferred on EVERY HR day (8/31, 9/4) and
+# SQL's HR copy stayed one cycle behind until the 13:00 task — Morning
+# Review's Master vs Sources / Exceptions sheets and the boss HR gap report
+# were built on the previous HR. A finished file that is merely young settles
+# in <= STABLE_SECONDS; a file still being written keeps refreshing its mtime
+# and is deferred as before.
+STABLE_WAIT_MAX = 150    # longest one cycle waits for a young file to settle
+STABLE_POLL = 10         # seconds between re-stats while waiting
 
 # View definition files re-applied automatically when edited (mtime change).
 VIEW_FILES = [SQL_DIR / "3_report_views.sql", SQL_DIR / "4_dimensions.sql"]
@@ -134,11 +148,12 @@ WATCH = {
     "mvp_roles":            lambda: _single(op.RAW_MVP_ROLE_MAPPINGS),
     "mvp_job_categories":   lambda: _single(op.RAW_MVP_JOB_CATEGORIES),
     "cornerstone":          lambda: _single(refresh._newest_by_mtime(
-                                op.RAW_CORNERSTONE_DIR.glob("Enterprise_Training_Report_*.xlsx"))),
+                                op.RAW_CORNERSTONE_DIR.glob("Enterprise_Training_Report*.xlsx"))),
     "epic_status":          _epic_status_files,
+    "epic_status_summary":  lambda: _single(op.RAW_EPIC_STATUS_SUMMARY),
     "epic_lookup":          lambda: _single(op.RAW_EPIC_TM_DIR / "Epic Team Member Lookup.xlsx"),
     "epic_class_schedule":  lambda: _single(refresh._newest_by_mtime(
-                                op.RAW_EPIC_CLASS_SCHEDULES_DIR.glob("epic_class_schedule_*.xlsx"))),
+                                op.RAW_EPIC_CLASS_SCHEDULES_DIR.glob("epic_class_schedule*.xlsx"))),
     "wave_change_requests": lambda: sorted(
                                 p for p in op.RAW_WAVE_CHANGE_REQUESTS_DIR
                                 .glob("Wave Change Request Form*.xlsx")
@@ -180,6 +195,26 @@ def is_stable(sig: dict[str, list[float]]) -> bool:
     """False if any file was modified < STABLE_SECONDS ago (mid-sync risk)."""
     now = time.time()
     return all(now - mtime >= STABLE_SECONDS for mtime, _size in sig.values())
+
+
+def settle(resolver) -> tuple[dict[str, list[float]] | None, int]:
+    """Wait for a young source to finish landing.
+
+    Re-stats the file set every STABLE_POLL seconds until every file is
+    >= STABLE_SECONDS old (a file still being written / synced keeps
+    refreshing its mtime, so it never qualifies). Returns (signature, seconds
+    waited) once settled, or (None, seconds waited) if it was still changing
+    after STABLE_WAIT_MAX — the caller defers it to the next cycle.
+    """
+    waited = 0
+    sig = signature(resolver())
+    while sig is not None and not is_stable(sig) and waited < STABLE_WAIT_MAX:
+        time.sleep(STABLE_POLL)
+        waited += STABLE_POLL
+        sig = signature(resolver())
+    if sig is None or not is_stable(sig):
+        return None, waited
+    return sig, waited
 
 
 def lock_is_fresh(path: Path, max_age_hours: float) -> bool:
@@ -256,6 +291,7 @@ def main() -> int:
         # -- what changed? -------------------------------------------------
         to_load: list[tuple[str, dict]] = []
         deferred: list[str] = []
+        settled: list[str] = []
         for name, resolver in WATCH.items():
             sig = signature(resolver())
             if sig is None:
@@ -263,8 +299,16 @@ def main() -> int:
             if not args.force and state.get(name) == sig:
                 continue  # unchanged
             if not args.force and not is_stable(sig):
-                deferred.append(name)  # too fresh — likely mid-sync; next cycle
-                continue
+                # Young file: wait for it to finish landing instead of skipping
+                # the cycle — the pipeline's own outputs (cleaned HR) are
+                # always young when prep's sql_refresh runs.
+                sig, waited = settle(resolver)
+                if sig is None:
+                    deferred.append(name)  # still changing after STABLE_WAIT_MAX
+                    continue
+                settled.append(f"{name} ({waited}s)")
+                if state.get(name) == sig:
+                    continue  # settled back to what is already loaded
             to_load.append((name, sig))
 
         view_changes: list[tuple[Path, dict]] = []
@@ -276,8 +320,11 @@ def main() -> int:
             if args.force or state.get(key) != sig:
                 view_changes.append((vf, sig))
 
+        if settled:
+            log_line(f"settled (waited for a young file): {', '.join(settled)}")
         if deferred:
-            log_line(f"deferred (modified <{STABLE_SECONDS}s ago): {', '.join(deferred)}")
+            log_line(f"deferred (still changing after {STABLE_WAIT_MAX}s): "
+                     f"{', '.join(deferred)}")
         if not to_load and not view_changes:
             if args.ensure_snapshot:
                 try:
@@ -331,6 +378,18 @@ def main() -> int:
                 views_applied.append(vf.name)
             else:
                 failed.append(vf.name)
+
+        # -- re-bind view metadata whenever a raw table was reloaded --------
+        # A raw table can change SHAPE (new export column, renamed Master
+        # column) and SELECT * alias views keep the old column list until
+        # they're refreshed. refresh.py does this at the end of its own runs;
+        # auto_refresh calls the loaders directly, so it must too.
+        if loaded:
+            try:
+                n = refresh.refresh_view_metadata(engine)
+                log_line(f"views re-bound: {n}")
+            except Exception as e:
+                log_line(f"FAILED  view re-bind: {e}")
 
         # -- snapshot + runlogs piggyback when data actually changed --------
         if loaded:

@@ -516,9 +516,12 @@ GO
                 replicated — counts may differ by an alias edge case.
    ---------------------------------------------------------------- */
 CREATE OR ALTER VIEW report.hr_missing_from_wave AS
+-- 2026-08-26: mu now reads the pre-built indexed key table (raw.uids_master,
+-- built by refresh.build_uids on every master load) rather than re-deriving
+-- DISTINCT UPPER(TRIM()) over the raw.master heap each call. 19s -> <1s,
+-- verified row-for-row identical.
 WITH mu AS (
-    SELECT DISTINCT UPPER(LTRIM(RTRIM(UniversalID))) AS u FROM raw.[master]
-    WHERE LTRIM(RTRIM(ISNULL(UniversalID,''))) <> ''
+    SELECT UniversalID AS u FROM raw.uids_master
 ),
 rl AS (
     SELECT DISTINCT UPPER(LTRIM(RTRIM(Leader))) AS l FROM raw.ref_leaders
@@ -553,7 +556,12 @@ GO
    Shows      : Epic Team Member Lookup people on the RCM-Centralized
                 curriculum with no Master row. SQL twin of
                 missing_from_wave_epic.py / the not-in-wave review CSV.
-   Built from : raw.epic_lookup + raw.master
+   Built from : raw.epic_lookup + raw.uids_master
+   Paired with: report.exceptions check 1 (3_report_views.sql) returns this
+                same population as a must-be-zero alarm with 3 columns. The
+                anti-join is written out in both places on purpose — this file
+                applies after that one, so that view cannot depend on this.
+                Change one, change the other.
    ---------------------------------------------------------------- */
 CREATE OR ALTER VIEW report.epic_missing_from_wave AS
 SELECT e.[Wave],
@@ -571,10 +579,13 @@ SELECT e.[Wave],
        e.[Direct_Manager]   AS DirectManager,
        e.[Team_Member_Hire_Date] AS HireDate
 FROM raw.epic_lookup e
+-- 2026-08-26: indexed key-table anti-join instead of a correlated NOT EXISTS
+-- over the raw.master heap. 31s -> 0.1s, verified row-for-row identical.
+LEFT JOIN raw.uids_master mu
+       ON mu.UniversalID = UPPER(LTRIM(RTRIM(e.[Universal_ID])))
 WHERE LTRIM(RTRIM(ISNULL(e.[Universal_ID],''))) <> ''
   AND LTRIM(RTRIM(ISNULL(e.[Curriculum_Type],''))) = 'Revenue Cycle - Centralized'
-  AND NOT EXISTS (SELECT 1 FROM raw.[master] m
-                  WHERE UPPER(LTRIM(RTRIM(m.UniversalID))) = UPPER(LTRIM(RTRIM(e.[Universal_ID]))));
+  AND mu.UniversalID IS NULL;
 GO
 
 /* ---------- report.wave_missing_from_sources ----------
@@ -744,4 +755,304 @@ CREATE OR ALTER VIEW pbi.master_validations AS SELECT * FROM report.master_valid
 GO
 
 PRINT 'dim.* views + report.mapping_gaps + Master QA layer created/updated.';
+GO
+
+
+/* ---------- report.epic_training_rollup — Epic status per person ------------
+   Added      : 2026-08-26.
+   Shows      : one row per Universal ID in raw.epic_status — the SAME
+                aggregation report.tracker_training_status performs, including
+                its IsExcluded rule (Advanced Reporting / Charge Capture are
+                optional workshops), but WITHOUT the wave-file gate.
+   Why        : report.tracker_training_status joins report.users WHERE
+                IsInScope = 1 and Leader on the canonical list, so anyone not on
+                the wave file gets no row at all. The LAVA SVC-provisioning
+                group is exactly that: 356 people with real Epic registrations
+                (348 of them on EPIC_NH_SIMPLE VISIT CODING ERROR RESOLUTION)
+                who came back completely blank. Per the analyst 2026-08-26 they are
+                tracked like anyone else — if Epic or Cornerstone has training
+                for someone, it gets filled in; blank is only for people we
+                truly have nothing on.
+   Contract   : verified identical to report.tracker_training_status on all
+                6,914 on-leader-list wave people for TrainingStatus,
+                FullyRegisteredYN, FinalScheduledDate and the three class counts
+                (counts match once its ISNULL(...,0) is applied). Consumers must
+                prefer the tracker where it has a row and use this to fill the
+                rest, so the two can never disagree.
+   Used by    : refresh.build_lava_list() (report.lava_list) and
+                scripts\build_lava_list.py — one definition, both consumers.
+   ------------------------------------------------------------------------ */
+CREATE OR ALTER VIEW report.epic_training_rollup AS
+WITH src AS (
+    SELECT UPPER(LTRIM(RTRIM(s.Universal_Id))) AS UniversalID,
+           CASE WHEN s.Fully_Trained    LIKE '%Yes%' THEN 1 ELSE 0 END AS FT,
+           CASE WHEN s.Fully_Registered LIKE '%Yes%' THEN 1 ELSE 0 END AS FR,
+           s.Event_Class,
+           s.Event_Class_Registered AS Registered,
+           s.Event_Class_Status     AS Status,
+           TRY_CONVERT(datetime, s.Event_Class_Date)  AS EventDate,
+           TRY_CONVERT(datetime, s.Registration_Date) AS RegistrationDate,
+           CASE WHEN s.Event_Class_Type = 'Session'
+                     AND UPPER(s.Event_Class) NOT LIKE '%ADVANCED REPORTING%'
+                     AND UPPER(s.Event_Class) NOT LIKE '%CHARGE CAPTURE%'
+                     AND UPPER(ISNULL(s.Curriculum,'')) NOT LIKE '%ADVANCED REPORTING%'
+                     AND UPPER(ISNULL(s.Curriculum,'')) NOT LIKE '%CHARGE CAPTURE%'
+                THEN 1 ELSE 0 END AS IsSession
+    FROM raw.epic_status s
+    WHERE LTRIM(RTRIM(ISNULL(s.Universal_Id,''))) <> ''
+)
+SELECT UniversalID,
+       MAX(FT) AS FT,
+       MAX(FR) AS FR,
+       CASE WHEN MAX(FT) = 1 THEN 'Fully Trained'
+            WHEN COUNT(DISTINCT CASE WHEN IsSession = 1 AND Status LIKE 'Completed%'
+                                     THEN Event_Class END) > 0 THEN 'In Progress'
+            ELSE 'Not Started' END AS TrainingStatus,
+       CASE WHEN MAX(FR) = 1 THEN 'Yes' ELSE 'No' END AS FullyRegisteredYN,
+       CASE WHEN MAX(FT) = 1 THEN 'Yes' ELSE 'No' END AS FullyTrainedYN,
+       COUNT(DISTINCT CASE WHEN IsSession = 1 THEN Event_Class END) AS ClassesRequired,
+       COUNT(DISTINCT CASE WHEN IsSession = 1 AND Status LIKE 'Completed%'
+                           THEN Event_Class END) AS ClassesCompleted,
+       COUNT(DISTINCT CASE WHEN IsSession = 1
+                            AND (Registered LIKE '%Yes%' OR Status LIKE 'Completed%')
+                           THEN Event_Class END) AS ClassesRegistered,
+       MAX(CASE WHEN IsSession = 1 AND Status LIKE 'Completed%'
+                THEN EventDate END) AS LastAttendedDate,
+       MAX(CASE WHEN IsSession = 1
+                 AND (Registered LIKE '%Yes%' OR Status LIKE 'Completed%')
+                THEN EventDate END) AS FinalScheduledDate,
+       MAX(CASE WHEN IsSession = 1
+                 AND (Registered LIKE '%Yes%' OR Status LIKE 'Completed%')
+                 AND Status LIKE '%Equivalent%' THEN 1 ELSE 0 END) AS HasEquiv
+FROM src
+GROUP BY UniversalID;
+GO
+
+PRINT 'report.epic_training_rollup created/updated.';
+GO
+
+/* ---------- report.lava_list — LAVA Wave census (working LAVA list) ------------------
+   Added      : 2026-08-26 (the analyst's ask — LAVA queryable daily without having
+                to run the script).
+   Population : the union of
+                  (a) WAVE — tagged for training on the wave file
+                             (report.users.TrainingNeeded = 'Yes'), and
+                  (b) SVC  — holds a "Simple Visit Coding" job role in MVP AND
+                             appears in the Epic "Curriculum Status by User
+                             Summary" export, i.e. someone we actually have Epic
+                             status data on.
+                Filter by wave at the call site: WHERE Wave = 'Wave 3'.
+   SVC source : per the analyst 2026-08-26, SVC is NOT read from the ad_hoc
+                "Curriculum Status by User - SVC.xlsx" — that file was only the
+                summary export pre-filtered, and it goes stale. Same derivation
+                build_soft_live_list.py already uses.
+   Built by   : refresh.build_lava_list() -> raw.lava_person, refreshed with
+                    python sql
+efresh.py lava
+                It is assembled in stages in Python rather than expressed as one
+                view because as a single view it NEVER RETURNED: every join is
+                individually fast (~6s all told) but SQL Server could not plan 12
+                joins off a UNION-derived driving set — 27 table scans, 27 sorts,
+                and it refused to prune the LEFT JOINs, so projecting one column
+                cost 41s. Materialising the driving set first takes 8s.
+   NOT here   : FEC / Soft Live / Workqueue Owner as *typed* answers — those are
+                hand-entered in the workbook and carried forward on rebuild, so
+                no view can hold them. Only the system-of-record values
+                (report.users + wave change requests) appear here; Workqueue
+                Owner has no system of record at all.
+   ------------------------------------------------------------------------ */
+-- On a fresh database this file runs before anything has been loaded, so the
+-- table may not exist yet. Create an empty stand-in so the view is always
+-- creatable; refresh.py's sp_refreshview pass re-binds the view to the real
+-- column list the first time `refresh.py lava` populates it.
+IF OBJECT_ID('raw.lava_person') IS NULL
+    EXEC('SELECT CAST(NULL AS NVARCHAR(450)) AS UniversalID INTO raw.lava_person WHERE 1 = 0');
+GO
+
+CREATE OR ALTER VIEW report.lava_list AS
+SELECT * FROM raw.lava_person;
+GO
+
+PRINT 'report.lava_list created/updated.';
+GO
+
+/* ---------- report.svc_population — the SVC (Simple Visit Coding) user population -----
+   Added      : 2026-09-15 (the analyst's ask — "is there a SQL view for just the SVC user
+                population? if not can you create one").
+   Grain      : ONE ROW PER PERSON, every wave. Filter at the call site, e.g.
+                  WHERE Wave = 'Wave 3'
+   Rule       : the census SVC rule — holds a Simple Visit Coding job role (in MVP, or
+                assigned on a Wave Change Request Form that MVP does not carry yet —
+                SVCSource says which) AND appears in the Epic Curriculum Status by
+                User Summary export (we have Epic status data on them). Being in the
+                wave file is NOT required: OnWaveFile / Population show who is.
+   Source     : report.lava_list (raw.lava_person, rebuilt by `python sql/refresh.py lava`
+                and by the daily `lava` step). Same rows the LAVA census workbook tags
+                SVC Provisioning / SVC + WQ Owner / Wave + SVC.
+   Current    : IsCurrent = 0 when HR or Epic shows leave / termination (Larry's rule
+                2026-09-15 — the census counts only current people); add
+                WHERE IsCurrent = 1 AND (Wave = 'Wave 3' OR OnWave3DNFBList = 'Yes')
+                to match the census exactly.
+   ------------------------------------------------------------------------ */
+CREATE OR ALTER VIEW report.svc_population AS
+SELECT UniversalID, FullName, Wave, Leader, AVP, VP, OnWaveFile, Population,
+       SVCJobRole, SVCSource, JobRole1, JobRole2, JobRole3, JobRole4,
+       IsGuesthouse, VendorYN, UserType, JobTitle, Department, BusinessUnitDescription,
+       Email, DirectManager, TrainingStatus, FullyRegistered, FullyTrained,
+       EstCompletionDate, FECAccess, SoftLiveAccess, IsInScope, OnLeaderList,
+       HRStatus, EpicHRStatus, OnWave3DNFBList, IsCurrent
+FROM report.lava_list
+WHERE SVCYN = 'Yes';
+GO
+
+PRINT 'report.svc_population created/updated.';
+GO
+
+/* ---------- report.dnfb_workqueue_owners — who owns a DNFB workqueue ---------------
+   Added      : 2026-09-09 (the analyst's ask — "an SQL view for all DNFB workqueue owners").
+   Grain      : ONE ROW PER OWNER (person), every wave. Filter at the call site:
+                  WHERE OnWave3DNFBList = 'Yes'     -> the boss's Wave 3 DNFB list (71)
+                  WHERE DNFBWorkqueuesWave3 > 0     -> owns any Wave 3 DNFB workqueue (85)
+   Source     : raw.epic_workqueue_ownership = the "Epic Workqueue Ownership (83)"
+                tab of data\raw\ad_hoc\DNFB Owners for LAva*.xlsx (newest copy), loaded
+                daily through source_registry.xlsx. A DNFB workqueue is a row whose
+                Specialty Grouper = 'DNFB'; the owner is the email in
+                "WQ Owner (Supervisor) (Input)" — the file carries NO Universal ID.
+   Owner list : the file's hand-made "Wave 3 DNFB Owners" tab is NOT read. It is
+                exactly the distinct owners of Wave 3 DNFB workqueues whose Workgroup
+                Owner Name is not 'Simple Visit Coding' (verified identical, 71 = 71,
+                2026-09-09); OnWave3DNFBList reproduces it so a fresh export
+                keeps it current without anyone re-pasting the tab.
+   Identity   : email -> UniversalID via MVP UserUPN (508 of 551), else HR
+                Email_Address (the other 43 — local-part <> UID, e.g. a_goldberg2),
+                else the email local-part. IdSource says which. Name / leader chain
+                come from the Master (report.users) when the person is on the wave
+                file, otherwise from HR (report.hr) — most DNFB owners are NOT rev
+                cycle under Dr Lastname03, so most are HR-only.
+   Waves      : WaveFileWave = the Master's GoLiveWave (wave-file people only);
+                MVPWave = MVP GoLiveWave (everyone). Off-wave people still own
+                Wave 3 DNFB workqueues on purpose (her boss, 2026-09-02).
+   ------------------------------------------------------------------------ */
+-- On a fresh database this file runs before anything has been loaded, so the
+-- table may not exist yet. Create an empty stand-in with the columns the view
+-- reads so the view is always creatable; `refresh.py sources` replaces it.
+IF OBJECT_ID('raw.epic_workqueue_ownership') IS NULL
+    EXEC('SELECT CAST(NULL AS NVARCHAR(4000)) AS WQ_Name, CAST(NULL AS NVARCHAR(4000)) AS Wave,
+                 CAST(NULL AS NVARCHAR(4000)) AS Specialty_Grouper,
+                 CAST(NULL AS NVARCHAR(4000)) AS Workgroup_Owner_Name,
+                 CAST(NULL AS NVARCHAR(4000)) AS WQ_Owner_Supervisor_Input,
+                 CAST(NULL AS NVARCHAR(4000)) AS Core_Y_is_Rev_Cycle_Dr_Brogan,
+                 CAST(NULL AS NVARCHAR(4000)) AS Site,
+                 CAST(NULL AS NVARCHAR(4000)) AS Sim_New_Grouper_4,
+                 CAST(NULL AS NVARCHAR(4000)) AS _source_file
+          INTO raw.epic_workqueue_ownership WHERE 1 = 0');
+GO
+
+CREATE OR ALTER VIEW report.dnfb_workqueue_owners AS
+WITH wq AS (                    -- every DNFB workqueue with an owner email
+    SELECT LOWER(LTRIM(RTRIM(WQ_Owner_Supervisor_Input)))            AS OwnerEmail,
+           LTRIM(RTRIM(Wave))                                        AS WQWave,
+           LTRIM(RTRIM(WQ_Name))                                     AS WQName,
+           LTRIM(RTRIM(Workgroup_Owner_Name))                        AS Workgroup,
+           LTRIM(RTRIM(Site))                                        AS Site,
+           LTRIM(RTRIM(Sim_New_Grouper_4))                           AS OwningGroup,
+           UPPER(LTRIM(RTRIM(Core_Y_is_Rev_Cycle_Dr_Brogan)))        AS Core,
+           _source_file                                              AS SourceFile
+    FROM raw.epic_workqueue_ownership
+    WHERE UPPER(LTRIM(RTRIM(Specialty_Grouper))) = 'DNFB'
+      AND WQ_Owner_Supervisor_Input LIKE '%@%'
+),
+owners AS (SELECT DISTINCT OwnerEmail FROM wq),
+-- Email -> UniversalID. Join the ~550 owner emails INTO the big raw tables and
+-- collapse afterwards; ROW_NUMBER over all of raw.mvp / raw.hr first is the
+-- pattern that never finishes (see raw.mvp_person).
+via_mvp AS (
+    SELECT o.OwnerEmail, MIN(UPPER(LTRIM(RTRIM(m.UniversalID)))) AS UniversalID
+    FROM owners o
+    JOIN raw.mvp m ON LOWER(LTRIM(RTRIM(m.UserUPN))) = o.OwnerEmail
+    WHERE LTRIM(RTRIM(ISNULL(m.UniversalID, ''))) <> ''
+    GROUP BY o.OwnerEmail
+),
+via_hr AS (
+    SELECT o.OwnerEmail, MIN(UPPER(LTRIM(RTRIM(h.UniversalID)))) AS UniversalID
+    FROM owners o
+    JOIN raw.hr h ON LOWER(LTRIM(RTRIM(h.Email_Address))) = o.OwnerEmail
+    WHERE LTRIM(RTRIM(ISNULL(h.UniversalID, ''))) <> ''
+    GROUP BY o.OwnerEmail
+),
+ids AS (
+    SELECT o.OwnerEmail,
+           COALESCE(mv.UniversalID, hr.UniversalID,
+                    UPPER(LEFT(o.OwnerEmail, CHARINDEX('@', o.OwnerEmail) - 1))) AS UniversalID,
+           CASE WHEN mv.UniversalID IS NOT NULL THEN 'MVP'
+                WHEN hr.UniversalID IS NOT NULL THEN 'HR'
+                ELSE 'Email local-part' END                                     AS IdSource
+    FROM owners o
+    LEFT JOIN via_mvp mv ON mv.OwnerEmail = o.OwnerEmail
+    LEFT JOIN via_hr  hr ON hr.OwnerEmail = o.OwnerEmail
+),
+agg AS (
+    SELECT OwnerEmail,
+           COUNT(*)                                                    AS DNFBWorkqueues,
+           SUM(CASE WHEN WQWave = 'Wave 1' THEN 1 ELSE 0 END)          AS DNFBWorkqueuesWave1,
+           SUM(CASE WHEN WQWave = 'Wave 2' THEN 1 ELSE 0 END)          AS DNFBWorkqueuesWave2,
+           SUM(CASE WHEN WQWave = 'Wave 3' THEN 1 ELSE 0 END)          AS DNFBWorkqueuesWave3,
+           SUM(CASE WHEN WQWave = 'Wave 3'
+                     AND Workgroup <> 'Simple Visit Coding' THEN 1 ELSE 0 END) AS Wave3NonSVC,
+           MAX(CASE WHEN Core = 'Y' THEN 1 ELSE 0 END)                 AS CoreRevCycle,
+           MAX(SourceFile)                                             AS SourceFile
+    FROM wq GROUP BY OwnerEmail
+),
+wave_list AS (
+    SELECT OwnerEmail, STRING_AGG(CAST(WQWave AS NVARCHAR(MAX)), ', ') WITHIN GROUP (ORDER BY WQWave) AS v
+    FROM (SELECT DISTINCT OwnerEmail, WQWave FROM wq WHERE WQWave IS NOT NULL) d GROUP BY OwnerEmail
+),
+group_list AS (
+    SELECT OwnerEmail, STRING_AGG(CAST(Workgroup AS NVARCHAR(MAX)), ', ') WITHIN GROUP (ORDER BY Workgroup) AS v
+    FROM (SELECT DISTINCT OwnerEmail, Workgroup FROM wq WHERE Workgroup IS NOT NULL) d GROUP BY OwnerEmail
+),
+site_list AS (
+    SELECT OwnerEmail, STRING_AGG(CAST(Site AS NVARCHAR(MAX)), ', ') WITHIN GROUP (ORDER BY Site) AS v
+    FROM (SELECT DISTINCT OwnerEmail, Site FROM wq WHERE Site IS NOT NULL) d GROUP BY OwnerEmail
+),
+wq_list AS (
+    SELECT OwnerEmail, STRING_AGG(CAST(WQName AS NVARCHAR(MAX)), ' | ') WITHIN GROUP (ORDER BY WQName) AS v
+    FROM (SELECT DISTINCT OwnerEmail, WQName FROM wq WHERE WQName IS NOT NULL) d GROUP BY OwnerEmail
+)
+SELECT
+    i.UniversalID,
+    COALESCE(u.FullName, h.FullName)                              AS FullName,
+    i.OwnerEmail                                                  AS Email,
+    i.IdSource,
+    CASE WHEN u.UniversalID IS NOT NULL THEN 'Yes' ELSE 'No' END  AS OnWaveFile,
+    u.Wave                                                        AS WaveFileWave,
+    mp.GoLiveWave                                                 AS MVPWave,
+    COALESCE(u.Leader, h.Leader)                                  AS Leader,
+    COALESCE(u.AVP, h.AVP)                                        AS AVP,
+    COALESCE(u.VP, h.VP)                                          AS VP,
+    h.JobTitle,
+    h.Department,
+    CASE WHEN a.CoreRevCycle = 1 THEN 'Y' ELSE 'N' END            AS CoreRevCycle,
+    CASE WHEN a.Wave3NonSVC > 0 THEN 'Yes' ELSE 'No' END          AS OnWave3DNFBList,
+    a.DNFBWorkqueues,
+    a.DNFBWorkqueuesWave1,
+    a.DNFBWorkqueuesWave2,
+    a.DNFBWorkqueuesWave3,
+    wl.v                                                          AS WorkqueueWaves,
+    gl.v                                                          AS Workgroups,
+    sl.v                                                          AS Sites,
+    ql.v                                                          AS Workqueues,
+    a.SourceFile
+FROM ids i
+JOIN agg a               ON a.OwnerEmail  = i.OwnerEmail
+LEFT JOIN wave_list  wl  ON wl.OwnerEmail = i.OwnerEmail
+LEFT JOIN group_list gl  ON gl.OwnerEmail = i.OwnerEmail
+LEFT JOIN site_list  sl  ON sl.OwnerEmail = i.OwnerEmail
+LEFT JOIN wq_list    ql  ON ql.OwnerEmail = i.OwnerEmail
+LEFT JOIN report.users u ON u.UniversalID = i.UniversalID
+LEFT JOIN report.hr    h ON h.UniversalID = i.UniversalID
+LEFT JOIN raw.mvp_person mp ON mp.UniversalID = i.UniversalID;
+GO
+
+PRINT 'report.dnfb_workqueue_owners created/updated.';
 GO

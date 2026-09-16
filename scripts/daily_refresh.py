@@ -208,6 +208,12 @@ def _sql(*args: str) -> list[str]:
 # hr_preview must precede hr_apply (it diffs Master vs HR). metrics reads the
 # MVP runlog tab + SQL gap views (post-sql_post); team_file republishes the
 # Master, so last.
+#
+# 2026-08-11: SQL updates AFTER the wave file. The Master writers run first,
+# then sql_stage loads the finished roster so training_status reads a current
+# report.users (same-day coverage for people added this run), then sql_post
+# reloads + stamps history from the final workbook. Anything reading raw.master
+# must sit after sql_post.
 PREP_STEPS = [
     ("preflight",      "Preflight checks",                    None,                                      gate_always),
     ("clean_hr",       "Clean raw HR export",                 _script("clean_hr.py"),                    gate_clean_hr),
@@ -223,7 +229,7 @@ PREP_STEPS = [
 APPLY_STEPS = [
     ("guard",              "Apply-stage guard",               None,                                      gate_always),
     # Pre-rebuild safety copies (added 2026-07-28): yesterday's Tracker +
-    # Daily Log get a .bak.<date> in master_reports\archive\, and the Master's
+    # Daily Log get a .bak.<date> in Main Reports\Backups\, and the Master's
     # daily full backup is guaranteed even if no updater writes today.
     # At most one backup per file per day — re-runs are no-ops.
     ("backups",            "Daily safety copies (revert points)",
@@ -234,6 +240,20 @@ APPLY_STEPS = [
     ("add_members",        "Add missing people to Master",    _script("add_missing_to_master.py", "--apply"), gate_always),
     ("mvp_update",         "Master update from MVP",          _script("update_master_from_mvp.py"),      gate_always),
     ("hr_apply",           "Master update from HR (xlwings)", _script("update_master_from_hr_safe.py"),  gate_always),
+    # Email onto the Master (2026-09-02, her ask "for wave it is just emails").
+    # After hr_apply because HR is the primary source, and before sql_stage so
+    # the column lands in raw.master on the same run. Resolution is shared with
+    # the Team File, Tracker, LAVA and Soft Live list via email_lookup.py, so a
+    # person's address is identical everywhere. Hand-typed cells are preserved.
+    ("email",              "Email onto Master",               _script("update_master_email.py", "--apply"), gate_always),
+    # FEC Participant? / Soft Live Participant blanks -> No (her rule 2026-09-09:
+    # "those columns should not be blank. if there is no info for that, then put
+    # no"). add_members leaves the two cells empty on brand-new rows, so this
+    # runs after every Master writer and before sql_stage. Blanks only — a
+    # hand-entered Yes/No is never touched. No-op once the columns are full.
+    ("participation",      "Default blank FEC / Soft Live to No",
+                           _script("fill_master_participation_defaults.py", "--apply"), gate_always),
+    # (training_status moved below sql_stage 2026-08-11 — see the note there.)
     # (epic_lookup_update retired 2026-07-06: Epic-mirror columns removed from
     #  the Master — Epic data lives in SQL via epic.raw_team_member_lookup.)
     # (Retired 2026-07-27, per the analyst's pipeline-trim audit — outputs no
@@ -245,14 +265,38 @@ APPLY_STEPS = [
     #  Scripts archived under scripts\_archive\. gaps_hr stays — the weekly
     #  HR gap workbook is still shared.)
     ("gaps_hr",            "Gap report: HR not on wave",      _script("missing_from_wave_hr.py"),        gate_weekly_hr),
+    # SQL now updates AFTER the wave file is written (her call 2026-08-11).
+    # sql_stage reloads raw.master so report.users — and everything built on it,
+    # including report.tracker_training_status — reflects TODAY'S roster, adds
+    # from add_members included. training_status then reads a current source, so
+    # brand-new people get their status the same day instead of waiting a run.
+    # sql_post re-reloads afterwards and stamps history, so raw.master + the
+    # daily snapshot both carry the finished workbook. Master-only load, no
+    # snapshot — cheap (~4s), and the history stamp belongs on the final state.
+    ("sql_stage",          "SQL reload Master (pre training-status)",
+                           _sql("master"),                                    gate_always),
+    ("training_status",    "Mirror training status onto Master",
+                           _script("update_master_training_status.py", "--apply"), gate_always),
     ("sql_post",           "SQL reload Master + re-snapshot", _sql("master", "snapshot"),                gate_always),
+    # 2026-08-26: rebuild raw.lava_person (behind report.lava_list) from the
+    # finished roster. It reads report.* views, so it cannot run during the raw
+    # loads — it belongs here, after sql_post. ~10s. build_lava_list.py reads
+    # the same sources, so the workbook and the view always agree.
+    ("lava",               "Rebuild LAVA list (report.lava_list)",
+                           _sql("lava"),                                      gate_always),
+    # 2026-09-03 (her ask): the LAVA workbook is rebuilt daily too, BEFORE the
+    # tracker, which copies its four sheets in as snapshots — so the two can
+    # never disagree. ~30s; hand-typed review answers carry forward.
+    ("lava_workbook",      "Build LAVA workbook",             _script("build_lava_list.py"),             gate_always),
     ("boss_reports",       "Publish boss gap reports",        _script("export_boss_reports.py"),         gate_always),
     # tracker rebuilds from SQL, which sql_post just reloaded — skip its own
     # SQL pass. Aborts cleanly if either tracker workbook is open in Excel.
-    ("tracker",            "Rebuild RCM Training Tracker + Daily Log",
+    ("tracker",            "Rebuild RCM Training Tracker + Daily/Monthly Log",
                            _script("build_rcm_training_tracker.py", "--no-sql"), gate_always),
     ("metrics",            "Append metrics trend row",        _script("build_metrics_summary.py"),       gate_always),
     ("team_file",          "Publish RCM Wave Team File",      _script("build_team_wave_file.py"),        gate_always),
+    # wave_file_copy (2026-09-03 → 2026-09-10) retired: she keeps ONE main copy
+    # of the wave file and makes ad-hoc copies herself. Script in _archive.
     # Rebuild Morning Review LAST (added 2026-07-28) so it reports the whole
     # run: step results, errors, files updated, and post-apply gap state.
     ("review_refresh",     "Rebuild Morning Review (post-apply report)",
@@ -330,7 +374,10 @@ def run_stage(stage: str, args) -> int:
     completed, skipped = [], []
 
     try:
-        with open(log_path, "a", encoding="utf-8") as log_fh:
+        # buffering=1 (line buffered): step headers and OK/X lines must reach
+        # disk immediately — review_refresh reads this log to build Morning
+        # Review, and unflushed lines made the run look stuck at the prior step.
+        with open(log_path, "a", encoding="utf-8", buffering=1) as log_fh:
             log_fh.write(f"\n===== {stage} run {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
             for name, label, argv, gate in todo:
                 if name in args.skip:

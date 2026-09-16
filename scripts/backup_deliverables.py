@@ -43,6 +43,7 @@ ARCHIVE_DIR = op.MAIN_REPORTS_BACKUPS_DIR
 TARGETS = [
     MASTER_REPORTS_DIR / "RCM Training Tracker.xlsx",
     MASTER_REPORTS_DIR / "RCM Training Daily Log.xlsx",
+    MASTER_REPORTS_DIR / "RCM Training Monthly Log.xlsx",
 ]
 
 

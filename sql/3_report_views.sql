@@ -46,8 +46,11 @@ SELECT
     [Job_Role_4]                               AS JobRole4,
     [Training_Needed_Yes_No]                   AS TrainingNeeded,
     [IsDepartedInactive]                       AS Departed,
-    [FEC_Participant_Yes_No]                   AS FECParticipant,
-    [Soft_Live_Participant_Y_N]                AS SoftLiveParticipant,
+    -- Never blank (her rule 2026-09-09): a Master cell nobody has filled in
+    -- reads No. fill_master_participation_defaults.py writes the same default
+    -- onto the Master itself every apply run; this covers the gap in between.
+    ISNULL(NULLIF(LTRIM(RTRIM([FEC_Participant_Yes_No])),''),'No')    AS FECParticipant,
+    ISNULL(NULLIF(LTRIM(RTRIM([Soft_Live_Participant_Y_N])),''),'No') AS SoftLiveParticipant,
     [Terminated]                               AS TerminatedFlag,
     CASE WHEN LTRIM(RTRIM(ISNULL([Leaders],''))) IN
               (SELECT LTRIM(RTRIM(Leader)) FROM raw.ref_leaders)
@@ -180,20 +183,31 @@ GO
         step closes this daily, so any row here means something slipped.
      2. 'In scope but missing from HR' — active trainee whose UID is not
         in the HR export: org rollup impossible, usually a bad UID.
-   Built from : raw.epic_lookup + report.users + raw.uids_hr
+   Built from : raw.epic_lookup + report.users + raw.uids_hr + raw.uids_master
    ---------------------------------------------------------------- */
 CREATE OR ALTER VIEW report.exceptions AS
--- 1. Centralized on the Epic TM Lookup but absent from the Master
+-- 1. Centralized on the Epic TM Lookup but absent from the Master.
+--    DUPLICATE LOGIC, DELIBERATELY KEPT (reviewed 2026-08-26): this anti-join
+--    is the same population report.epic_missing_from_wave returns, presented
+--    differently — this sheet is the must-be-zero alarm, Missing Wave - Epic
+--    is the 14-column detail list. It is NOT collapsed into that view because
+--    it lives in 4_dimensions.sql, which applies AFTER this file; depending on
+--    it here would break a fresh database build. If you change the anti-join
+--    below, change it there too.
 SELECT UPPER(LTRIM(RTRIM(e.Universal_ID))) AS UniversalID,
        e.Team_Member                       AS FullName,
        e.Direct_Manager                    AS Leader,
        'Epic Centralized not on wave file' AS Issue
 FROM raw.epic_lookup e
+-- Seek the indexed raw.uids_master key table instead of a correlated NOT
+-- EXISTS over the wide NVARCHAR(4000) raw.master heap, which the optimizer
+-- resolved as a per-row nested loop (30s for 2 rows). Same rationale as
+-- raw.uids_hr below; verified row-for-row identical output.
+LEFT JOIN raw.uids_master mu
+       ON mu.UniversalID = UPPER(LTRIM(RTRIM(e.Universal_ID)))
 WHERE LTRIM(RTRIM(e.Curriculum_Type)) = 'Revenue Cycle - Centralized'
   AND LTRIM(RTRIM(ISNULL(e.Universal_ID,''))) <> ''
-  AND NOT EXISTS (SELECT 1 FROM raw.[master] m
-                  WHERE UPPER(LTRIM(RTRIM(m.UniversalID)))
-                      = UPPER(LTRIM(RTRIM(e.Universal_ID))))
+  AND mu.UniversalID IS NULL
 UNION ALL
 -- 2. In-scope users with no HR org record (org rollup will be blank)
 SELECT u.UniversalID, u.FullName, u.Leader,
@@ -2009,20 +2023,22 @@ WITH agg AS (
            MAX(CASE WHEN Fully_Registered LIKE '%Yes%' THEN 1 ELSE 0 END) AS FR,
            COUNT(DISTINCT CASE WHEN Event_Class_Type = 'Session'
                  AND IsExcluded = 0 THEN Event_Class END)           AS ClassesRequired,
+           /* 'Completed (Equivalent)' = equivalency credit (no session date)
+              — counts as completed, same as a plain 'Completed'. */
            COUNT(DISTINCT CASE WHEN Event_Class_Type = 'Session'
-                 AND IsExcluded = 0 AND Event_Class_Status = 'Completed'
+                 AND IsExcluded = 0 AND Event_Class_Status LIKE 'Completed%'
                  THEN Event_Class END)                              AS ClassesCompleted,
            COUNT(DISTINCT CASE WHEN Event_Class_Type = 'Session'
                  AND IsExcluded = 0
                  AND (Event_Class_Registered LIKE '%Yes%'
-                      OR Event_Class_Status = 'Completed')
+                      OR Event_Class_Status LIKE 'Completed%')
                  THEN Event_Class END)                              AS ClassesRegistered,
            MAX(CASE WHEN Event_Class_Type = 'Session' AND IsExcluded = 0
-                 AND Event_Class_Status = 'Completed'
+                 AND Event_Class_Status LIKE 'Completed%'
                  THEN EventDate END)                                AS LastAttendedDate,
            MAX(CASE WHEN Event_Class_Type = 'Session' AND IsExcluded = 0
                  AND (Event_Class_Registered LIKE '%Yes%'
-                      OR Event_Class_Status = 'Completed')
+                      OR Event_Class_Status LIKE 'Completed%')
                  THEN EventDate END)                                AS FinalScheduledDate,
            COUNT(DISTINCT CASE WHEN Event_Class_Type = 'Session'
                  AND IsExcluded = 0 AND Event_Class_Registered LIKE '%No%'
@@ -2032,16 +2048,19 @@ WITH agg AS (
     GROUP BY UniversalID
 ),
 lastclass AS (
+    /* Dated rows win (newest first); date-less rows (equivalency credit)
+       still yield a class name instead of a blank. */
     SELECT UniversalID, Event_Class AS LastRegisteredClass
     FROM (
         SELECT UniversalID, Event_Class,
                ROW_NUMBER() OVER (PARTITION BY UniversalID
-                                  ORDER BY EventDate DESC) AS rn
+                                  ORDER BY CASE WHEN EventDate IS NULL
+                                                THEN 1 ELSE 0 END,
+                                           EventDate DESC, Event_Class) AS rn
         FROM report.tracker_detail
         WHERE Event_Class_Type = 'Session' AND IsExcluded = 0
           AND (Event_Class_Registered LIKE '%Yes%'
-               OR Event_Class_Status = 'Completed')
-          AND EventDate IS NOT NULL
+               OR Event_Class_Status LIKE 'Completed%')
     ) x
     WHERE rn = 1
 )
@@ -2794,6 +2813,87 @@ CREATE OR ALTER VIEW pbi.tracker_training_status AS SELECT * FROM report.tracker
 GO
 /* pbi.metrics_history — Power BI alias of raw.metrics_summary (metric trend) */
 CREATE OR ALTER VIEW pbi.metrics_history    AS SELECT * FROM raw.metrics_summary;
+GO
+
+/* ---------- report.leader_business_units — BU headcount per leader ----------
+   Shows      : one row per Leader + BusinessUnit with user count
+   Built from : report.users (Leader) + raw.mvp BusinessUnit (the column the
+                MVP updater writes to the Master — NOT BusinessUnitDescription,
+                which is sparse), scoped to canonical leaders (raw.ref_leaders)
+   Added      : 2026-08-03 (the analyst's ask — leader/BU pull on demand)
+   --------------------------------------------------------------------------- */
+CREATE OR ALTER VIEW report.leader_business_units AS
+SELECT
+    u.Leader,
+    m.BusinessUnit,
+    COUNT(*) AS Users
+FROM report.users u
+JOIN raw.mvp m
+    ON UPPER(LTRIM(RTRIM(m.UniversalID))) = u.UniversalID
+JOIN raw.ref_leaders l
+    ON l.Leader = u.Leader
+GROUP BY u.Leader, m.BusinessUnit;
+GO
+
+/* ---------- report.user_training_summary — per-user training rollup ----------
+   Shows      : one row per Master user reporting to a canonical leader
+                (raw.ref_leaders; departed included — see DepartedInactive):
+                identity, leadership chain (SrDirector from HR), Epic TM
+                Lookup training flags (per-MVP + dashboard-eligible), MVP
+                departed flag, UserType, JobRoles 1-4, Fully Registered /
+                Trained Yes-No (Epic dashboard flags).
+                TrainingCompletionStatus = CORNERSTONE-driven (her call
+                2026-08-04, Cornerstone = training source of truth):
+                completed-class count (latest-live EPIC sessions, via
+                report.cornerstone_status) vs Epic ClassesRequired.
+                LatestCompletedClassDate = Cornerstone; Estimated date = Epic
+                (future schedules only exist in Epic). All dates DATE-only.
+                NULL status = outside training scope (e.g. not needed).
+   Built from : report.roster + report.hr + report.tracker_training_status
+                + report.cornerstone_status + raw.cornerstone
+   Added      : 2026-08-04 (the analyst's ask — leadership-ready user list)
+   --------------------------------------------------------------------------- */
+CREATE OR ALTER VIEW report.user_training_summary AS
+WITH corn_done AS (   -- latest completed EPIC session date per user (Cornerstone)
+    SELECT UPPER(LTRIM(RTRIM(User_ID))) AS UniversalID,
+           CAST(MAX(TRY_CONVERT(datetime, Transcript_Completed_Date)) AS date) AS LastCompletedDate
+    FROM raw.cornerstone
+    WHERE UPPER(LTRIM(RTRIM(ISNULL(Training_Provider,'')))) = 'EPIC'
+      AND Training_Type = 'Session'
+      AND Transcript_Status LIKE 'Completed%'
+    GROUP BY UPPER(LTRIM(RTRIM(User_ID)))
+)
+SELECT
+    r.UniversalID,
+    r.FullName,
+    r.Wave                    AS GoLiveWave,
+    hr.SeniorDirector         AS SrDirector,
+    r.AVP,
+    r.VP,
+    r.Leader                  AS Leaders,
+    r.EpicTrainingNeeded      AS TrainingRequiredPerMVP,
+    r.EpicEligible            AS TrainingRequiredDashboard,
+    r.Departed                AS DepartedInactive,
+    r.UserType,
+    r.JobRole1, r.JobRole2, r.JobRole3, r.JobRole4,
+    COALESCE(ts.FullyRegisteredYN,
+             CASE WHEN r.IsFullyRegistered = 1 THEN 'Yes' ELSE 'No' END) AS FullyRegisteredYN,
+    COALESCE(ts.FullyTrainedYN,
+             CASE WHEN r.IsFullyTrained = 1 THEN 'Yes' ELSE 'No' END)    AS FullyTrainedYN,
+    CASE WHEN ts.UniversalID IS NULL THEN NULL
+         WHEN ISNULL(ts.ClassesRequired, 0) = 0            THEN 'No Epic Curriculum'
+         WHEN ISNULL(cs.CompletedCount, 0) >= ts.ClassesRequired THEN 'Fully Trained'
+         WHEN ISNULL(cs.CompletedCount, 0) > 0             THEN 'In Progress'
+         WHEN ISNULL(cs.RegisteredCount, 0) > 0            THEN 'Registered'
+         ELSE 'Not Started' END                            AS TrainingCompletionStatus,
+    cd.LastCompletedDate                                   AS LatestCompletedClassDate,
+    CAST(ts.FinalScheduledDate AS date)                    AS EstimatedTrainingCompletionDate
+FROM report.roster r
+JOIN raw.ref_leaders l ON l.Leader = r.Leader
+LEFT JOIN report.hr hr ON hr.UniversalID = r.UniversalID
+LEFT JOIN report.tracker_training_status ts ON ts.UniversalID = r.UniversalID
+LEFT JOIN report.cornerstone_status cs ON cs.UniversalID = r.UniversalID
+LEFT JOIN corn_done cd ON cd.UniversalID = r.UniversalID;
 GO
 
 PRINT 'report.* views created/updated.';

@@ -23,7 +23,11 @@ import onedrive_paths as op
 
 FEEDS = [
     ("Cornerstone Enterprise Training Report",
-     op.RAW_CORNERSTONE_DIR, "Enterprise_Training_Report_*.xlsx"),
+     op.RAW_CORNERSTONE_DIR, "Enterprise_Training_Report*.xlsx"),
+    # NOTE 2026-08-04: Enterprise moved to a fixed overwrite filename
+    # (Enterprise_Training_Report.xlsx). Once the dated copies are gone the
+    # name comparison goes inert (same name every day) — mtime-based change
+    # detection in auto_refresh still catches every overwrite.
     # Cornerstone Roster Report PAUSED 2026-07-27 (last-resort source —
     # manually maintained, unverified filters, ambiguous user-ID columns).
     # Re-add here + re-enable in source_registry.xlsx to resume.

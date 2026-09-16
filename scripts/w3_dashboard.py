@@ -6,7 +6,7 @@
 """
 w3_dashboard.py — generate the auto-populated W3 executive scorecard dashboard.
 
-Read-only. Rebuilds REPORTS\\RCM W3 Scorecard Dashboard.html from SQL on every
+Read-only. Rebuilds Main Reports\\Dashboards\\RCM W3 Scorecard Dashboard.html from SQL on every
 run: headline KPI cards, the by-leader table, and two daily trend line charts
 (unregistered users, standing no-show sessions). Same brand theme as the
 executive dashboards (dark blue #002092 / bright blue #3399FF / light blue
@@ -38,22 +38,27 @@ import pandas as pd                      # noqa: E402
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "sql"))
 
+from onedrive_paths import DASHBOARDS_DIR  # noqa: E402
 from refresh import CONN                 # noqa: E402
 from sqlalchemy import create_engine     # noqa: E402
 
-OUT = ROOT / "REPORTS" / "RCM W3 Scorecard Dashboard.html"
+OUT = DASHBOARDS_DIR / "RCM W3 Scorecard Dashboard.html"
 
 BRIGHT_BLUE = "#3399FF"
 RED = "#DC2626"
 
 
 def dual_line_chart(dates: list[str], series: list[tuple[str, str, dict]],
-                    aria: str = "Unregistered and no-show users trend") -> str:
+                    aria: str = "Unregistered and no-show users trend",
+                    labels: str = "all") -> str:
     """Two-series SVG line chart on ONE shared y-axis (user counts).
     Polished spec: dashed recessive grid, 2.5px lines with a soft area tint,
     white-ringed markers with hover tooltips, value labels with a white halo
     so they never collide with the lines, legend beneath.
-    series = [(name, color, {date_label: value})]."""
+    series = [(name, color, {date_label: value})].
+    labels = "all" (a value on every point) or "ends" (first and last point of
+    each series only — for two dense series the per-point labels collide;
+    hover tooltips still cover every point)."""
     w, h = 960, 290
     ml, mr, mt, mb = 52, 28, 24, 40
     pw, ph = w - ml - mr, h - mt - mb
@@ -92,6 +97,7 @@ def dual_line_chart(dates: list[str], series: list[tuple[str, str, dict]],
             f'{x(idx[-1][0]):.1f},{base:.1f}" fill="{color}" fill-opacity="0.06"/>')
         lines.append(f'<polyline points="{pts}" fill="none" stroke="{color}" '
                      f'stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>')
+        label_at = {idx[0][0], idx[-1][0]} if labels == "ends" else {i for i, _ in idx}
         for i, v in idx:
             cx, cy = x(i), y(v)
             tip = f'<title>{name} — {dates[i]}: {v:.0f} users</title>'
@@ -99,6 +105,8 @@ def dual_line_chart(dates: list[str], series: list[tuple[str, str, dict]],
                 f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="11" fill="transparent">{tip}</circle>'
                 f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="4" fill="{color}" '
                 f'stroke="#ffffff" stroke-width="2">{tip}</circle>')
+            if i not in label_at:
+                continue
             # value label with a white halo (paint-order) so it reads over lines
             vlabels.append(
                 f'<text x="{cx:.1f}" y="{cy - 11:.1f}" text-anchor="middle" font-size="12.5" '

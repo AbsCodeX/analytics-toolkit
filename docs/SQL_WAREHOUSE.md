@@ -14,9 +14,14 @@ OneDrive data\ ──(refresh.py)──▶ raw.*  ──(views join + clean)─�
   Epic, Master                    copies                          joined
 ```
 
-Source files are read straight from OneDrive (newest of each type), via the shared
-path helpers in `scripts/onedrive_paths.py`:
-`C:\path\to\shared\workspace\data\`
+Source files are read via the shared path helpers in
+`scripts/onedrive_paths.py` (newest of each type) — never hand-build a path.
+Two roots since 2026-08-11:
+
+- **OneDrive** `C:\path\to\shared\workspace\data\`
+  — every raw export (HR, MVP, Cornerstone, Epic) and everything shared.
+- **Local** `C:\path\to\analytics\data\` — the Master
+  Wave File and its backups/snapshots only (`op.MASTER_WAVE_PATH`).
 
 ## The schemas — what goes where
 

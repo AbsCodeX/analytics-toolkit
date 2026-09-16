@@ -22,6 +22,20 @@ ONEDRIVE_ROOT = Path(
 )
 
 # ---------------------------------------------------------------------------
+# Local data root (2026-08-11, her call): the Master Wave File and everything
+# that belongs to it — daily backups, DATA snapshots, new-member review CSVs,
+# HR/training preview CSVs — live OFF OneDrive, under the code repo. Rationale:
+# the Master is written many times a day by xlwings/COM, and sync contention on
+# rapid saves is what caused the 2026-07-30 stale-open rollback. Nothing here is
+# shared; the RCM Wave Team File remains the only shareable roster on OneDrive.
+# The folder tree deliberately MIRRORS the OneDrive layout, so only the root
+# differs between a local path and its OneDrive counterpart.
+# ---------------------------------------------------------------------------
+LOCAL_ROOT = Path(__file__).resolve().parent.parent
+LOCAL_DATA_DIR = LOCAL_ROOT / "data"
+LOCAL_MAIN_REPORTS_DIR = LOCAL_DATA_DIR / "reports" / "Main Reports"
+
+# ---------------------------------------------------------------------------
 # Raw inputs
 # ---------------------------------------------------------------------------
 RAW_HR_PATH = ONEDRIVE_ROOT / "data" / "raw" / "hr" / "HR.xlsx"
@@ -33,11 +47,36 @@ RAW_MVP_JOB_CATEGORIES = RAW_MVP_DIR / "JobCategoriesData.csv"
 
 RAW_EPIC_TM_DIR = ONEDRIVE_ROOT / "data" / "raw" / "epic" / "epic_tm_lookup"
 RAW_EPIC_STATUS_DIR = ONEDRIVE_ROOT / "data" / "raw" / "epic" / "epic_status_details"
+# Epic "Curriculum Status by User Summary" — one row per person (not per
+# curriculum). This is the export the retired ad_hoc "…- SVC.xlsx" was just a
+# pre-filtered copy of, so SVC population is derived from it + the MVP job role
+# rather than from that stale file (2026-08-26).
+RAW_EPIC_STATUS_SUMMARY_DIR = ONEDRIVE_ROOT / "data" / "raw" / "epic" / "epic_status_summary"
+RAW_EPIC_STATUS_SUMMARY = RAW_EPIC_STATUS_SUMMARY_DIR / "Curriculum Status by User Summary.xlsx"
 RAW_EPIC_CLASS_SCHEDULES_DIR = ONEDRIVE_ROOT / "data" / "raw" / "epic" / "epic_class_schedules"
 
 RAW_CORNERSTONE_DIR = ONEDRIVE_ROOT / "data" / "raw" / "cornerstone" / "enterprise_training_reports"
 
 RAW_WAVE_CHANGE_REQUESTS_DIR = ONEDRIVE_ROOT / "data" / "raw" / "wave" / "wave_change_requests"
+# Hand-maintained change log rendered into the LAVA census 'Change Log' column
+# (2026-09-10, her ask). One row per change: UniversalID, Date, Note, By.
+RAW_LAVA_CHANGE_LOG = RAW_WAVE_CHANGE_REQUESTS_DIR.parent / "LAVA Change Log.xlsx"
+
+# Epic workqueue ownership census (boss ask 2026-09-02). Two tabs matter:
+# "Wave 3 DNFB Owners" — the DNFB owner short list — and
+# "Epic Workqueue Ownership (83)" — every workqueue and its owner. Owners are
+# identified by EMAIL ONLY (no Universal ID), so build_lava_list.py resolves
+# them through MVP UserUPN -> HR email -> email local-part. Newest file wins;
+# the glob keeps working when a fresher "as of <date>" copy is dropped in.
+RAW_AD_HOC_DIR = ONEDRIVE_ROOT / "data" / "raw" / "ad_hoc"
+WQ_OWNERS_GLOB = "DNFB Owners for LAva*.xlsx"
+
+
+def latest_wq_owners():
+    """Newest DNFB/workqueue-ownership export, or None if none is present."""
+    hits = sorted(RAW_AD_HOC_DIR.glob(WQ_OWNERS_GLOB),
+                  key=lambda f: f.stat().st_mtime, reverse=True)
+    return hits[0] if hits else None
 
 # ---------------------------------------------------------------------------
 # Main Reports — the ONE folder for all primary deliverables (2026-07-29).
@@ -49,13 +88,23 @@ MAIN_REPORTS_DIR = ONEDRIVE_ROOT / "data" / "reports" / "Main Reports"
 MAIN_REPORTS_BACKUPS_DIR = MAIN_REPORTS_DIR / "Backups"
 DASHBOARDS_DIR = MAIN_REPORTS_DIR / "Dashboards"
 
-# Master Wave File — sole source of truth going forward
-MASTER_WAVE_PATH = MAIN_REPORTS_DIR / "RCM Wave Data Master File.xlsx"
+# Master Wave File — sole source of truth going forward. LOCAL since
+# 2026-08-11 (see LOCAL_DATA_DIR above); the OneDrive copy was retired to
+# Main Reports\_retired_master_2026-08-11\ so nobody opens a stale one.
+MASTER_WAVE_PATH = LOCAL_MAIN_REPORTS_DIR / "RCM Wave Data Master File.xlsx"
+
+# Review CSVs written next to the Master (add_missing_to_master.py derives its
+# own path from MASTER_WAVE_PATH.parent, so it follows automatically).
+NEW_MEMBERS_DIR = LOCAL_MAIN_REPORTS_DIR / "new_members_added"
 
 # Shareable team copy of the Master (dashboard + lookups + clean roster only),
 # published by scripts/build_team_wave_file.py. Dated copies of each publish
 # land in WAVE_DISTRIBUTION_DIR/<month>/.
 TEAM_WAVE_FILE_PATH = MAIN_REPORTS_DIR / "RCM Wave Team File.xlsx"
+# Leadership copy of the Master (2026-09-03): DASHBOARD + dashboard data only,
+# values-only, no queries/connections. RETIRED 2026-09-10 (builder archived);
+# constant kept so old imports don't break.
+WAVE_FILE_COPY_PATH = MAIN_REPORTS_DIR / "Wave File Copy.xlsx"
 WAVE_DISTRIBUTION_DIR = (
     ONEDRIVE_ROOT / "data" / "processed" / "wave" / "wave_data_copies" / "wave_distribution_copies"
 )
@@ -69,19 +118,15 @@ GAP_REPORTS_DIR = ONEDRIVE_ROOT / "data" / "reports" / "gap_reports"
 
 # The consolidated morning review workbook (built by build_morning_review.py):
 # the ONE file the analyst opens before running the apply stage.
-# Workbook lives in Main Reports; the DIR keeps the supporting preview CSVs
-# and the morning-review archive.
-MORNING_REVIEW_DIR = ONEDRIVE_ROOT / "data" / "reports" / "morning_review"
+# Workbook + supporting HR preview CSV live in Main Reports; dated archive
+# copies go to Main Reports\Backups\<YYYY-MM>\ like every other deliverable
+# (the old data\reports\morning_review\ folder was retired 2026-07-30).
 MORNING_REVIEW_PATH = MAIN_REPORTS_DIR / "Morning Review.xlsx"
+# Preview CSV belongs to the Master's write path, so it moved local with it.
+HR_PREVIEW_CSV_PATH = LOCAL_MAIN_REPORTS_DIR / "hr_leader_changes_preview.csv"
 
-# Standard SQL-built reports (export_sql_reports.py): no-shows + unregistered.
-NO_SHOW_REPORTS_DIR = ONEDRIVE_ROOT / "data" / "reports" / "no_show"
-UNREGISTERED_REPORTS_DIR = ONEDRIVE_ROOT / "data" / "reports" / "unregistered"
-
-# Wave 3 daily registration package (export_w3_registration_reports.py):
-# one multi-tab workbook (unregistered / no-shows / no-show resolution /
-# daily leader summary / leader metrics) + the rolling look-back CSV.
-W3_REGISTRATION_REPORTS_DIR = ONEDRIVE_ROOT / "data" / "reports" / "registration_daily"
+# (No-show / unregistered / W3-registration export folders were retired with
+# their steps 2026-07-27 — the Tracker + Daily Log replaced those exports.)
 
 # CSI interactions tracker (scripts/csi_tracker.py): drop the daily
 # "CSI interactions by day" PDFs into CSI_INBOX_DIR, run the script, and it
@@ -135,8 +180,11 @@ RUNLOGS_DIR = ONEDRIVE_ROOT / "data" / "runlogs"
 # Full-workbook Master backups (at most one per calendar day) and DATA-sheet-only
 # versioned snapshots (one per actual Master edit) — both organized into monthly
 # subfolders via month_subdir() so the flat folders don't grow unbounded.
-MASTER_ARCHIVE_DIR = ONEDRIVE_ROOT / "data" / "reports" / "archive"
-WAVE_REPOSITORY_DIR = PROCESSED_DIR / "wave" / "wave_data_copies" / "wave_repository_copies"
+# Both moved local 2026-08-11 with the Master they back up.
+MASTER_ARCHIVE_DIR = LOCAL_DATA_DIR / "reports" / "archive"
+WAVE_REPOSITORY_DIR = (
+    LOCAL_DATA_DIR / "processed" / "wave" / "wave_data_copies" / "wave_repository_copies"
+)
 
 
 def month_subdir(base_dir: Path, when=None) -> Path:

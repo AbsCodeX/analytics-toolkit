@@ -33,6 +33,13 @@ Companion workbook "RCM Training Daily Log.xlsx" (same folder): Daily Totals
 report.tracker_daily_log (history since 2026-07-06; unregistered/no-show
 columns since 2026-07-15).
 
+Companion workbook "RCM Training Monthly Log.xlsx" (same folder, her ask
+2026-09-10): Monthly Totals + Monthly by Leader — month-end status (last
+snapshot of each month, month-over-month deltas, same columns as the Weekly
+Summary) and registration ACTIVITY per month from Cornerstone (sessions and
+people registered, completed, withdrawn, no-show, by the month the event is
+dated; history back to January 2026).
+
 Sources (all SQL — kept current by YourOrgSQLAutoRefresh / daily_refresh):
     report.tracker_detail, report.tracker_class_schedule, report.users,
     report.training_status, report.unregistered, report.w3_noshow_status,
@@ -74,6 +81,7 @@ if VENV_PY.exists() and Path(sys.executable).resolve() != VENV_PY.resolve():
     raise SystemExit(subprocess.call(
         [str(VENV_PY), str(Path(__file__).resolve()), *sys.argv[1:]]))
 
+import openpyxl                          # noqa: E402  (reads the LAVA workbook only)
 import pandas as pd                      # noqa: E402
 import xlsxwriter                        # noqa: E402
 
@@ -82,7 +90,8 @@ sys.path.insert(0, str(ROOT / "sql"))
 
 from onedrive_paths import ONEDRIVE_ROOT          # noqa: E402
 from refresh import CONN                          # noqa: E402
-from sqlalchemy import create_engine              # noqa: E402
+from sqlalchemy import create_engine
+from email_lookup import email_map              # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Config — W4 = change WAVE/WAVE_NUM/GO_LIVE (and the w3_* view names below
@@ -95,6 +104,20 @@ TREND_START = date(2026, 7, 1)   # exec chart hides weeks before this
 TITLE = f"RCM Wave {WAVE_NUM}"
 OUT_PATH = ONEDRIVE_ROOT / "data" / "reports" / "Main Reports" / "RCM Training Tracker.xlsx"
 LOG_PATH = ONEDRIVE_ROOT / "data" / "reports" / "Main Reports" / "RCM Training Daily Log.xlsx"
+MONTHLY_PATH = ONEDRIVE_ROOT / "data" / "reports" / "Main Reports" / "RCM Training Monthly Log.xlsx"
+ACTIVITY_START = date(2026, 1, 1)   # Cornerstone Enterprise export cutoff
+# LAVA Wave census (build_lava_list.py) — its sheets are copied into the
+# tracker on every build (her ask 2026-09-03). Newest dated file wins. Renamed
+# from "Preliminary User List" 2026-09-08; the legacy pattern is kept as a
+# fallback so an old file still loads if no census build exists yet.
+LAVA_DIR = ONEDRIVE_ROOT / "data" / "reports" / "Main Reports"
+LAVA_GLOB = "LAVA * Census current as of *.xlsx"
+LAVA_GLOB_LEGACY = "LAVA * Preliminary User List *.xlsx"
+LAVA_SHEETS = [("Executive Summary", "LAVA Exec Summary"),
+               ("LAVA List", "LAVA List"),
+               ("Guest House Job Roles", "LAVA Guest House Roles"),
+               ("SVC Export (raw)", "LAVA SVC Export"),
+               ("Not Current", "LAVA Not Current")]
 # Local-first build (2026-07-27): workbooks are written and QA'd in this
 # NON-synced staging folder, then published to OneDrive as one atomic copy
 # per file. Keeps OneDrive from ever seeing a partial write / Excel-open
@@ -106,6 +129,12 @@ STAGING = ROOT / "build_staging"
 EXCL_RE = re.compile(r"ADVANCED REPORTING|CHARGE CAPTURE", re.IGNORECASE)
 
 MAX_NAMES_PER_CELL = 15          # cap newline lists in Registration Schedule
+
+# User_Type_Offshore_Onshore_YourOrg on the Master, surfaced by report.users /
+# report.unregistered / report.w3_noshow_status as UserType. Display order for
+# the Unregistered Summary leader x user-type tables; a value outside this list
+# still lands in Grand Total and prints a build warning.
+USER_TYPES = ("Offshore", "Onshore", "YourOrg")
 
 # Notion-ish neutrals, one muted accent — matches the house report style
 # while keeping the old tracker's card/emoji layout.
@@ -156,6 +185,22 @@ def load_frames(engine) -> dict:
         "ORDER BY SnapshotDate, Leader", engine)
     f["snap_live"] = pd.read_sql(
         "SELECT * FROM report.w3_leader_snapshot", engine)
+    # Monthly Log activity feed: one row per Cornerstone EPIC transcript for
+    # the tracker population (same scope as report.users above). Dates are
+    # real datetimes in raw.cornerstone; the report.cornerstone_inscope view
+    # stores them as text and is far too slow for this.
+    f["activity"] = pd.read_sql(
+        f"""SELECT UPPER(c.User_ID) AS UniversalID, u.Leader, c.Transcript_Status AS Status,
+                   c.Transcript_Registration_Date AS RegDate,
+                   c.Training_Start_Date AS StartDate,
+                   c.Transcript_Completed_Date AS CompletedDate
+            FROM raw.cornerstone c
+            JOIN report.users u ON u.UniversalID = UPPER(c.User_ID)
+            WHERE c.Training_Provider = 'EPIC'
+              AND u.Wave = '{WAVE}' AND u.IsInScope = 1 AND u.TrainingNeeded = 'Yes'
+              AND u.Leader IN (SELECT LTRIM(RTRIM(Leader)) FROM raw.ref_leaders)
+              AND c.Transcript_Registration_Date >= '{ACTIVITY_START:%Y-%m-%d}'""",
+        engine)
     f["ref_leaders"] = pd.read_sql(
         "SELECT LTRIM(RTRIM(Leader)) AS Leader FROM raw.ref_leaders", engine)
     f["tstatus"] = pd.read_sql(
@@ -270,14 +315,23 @@ def compute(f: dict) -> dict:
     uid_name = users.set_index("UniversalID")["FullName"]
 
     # ---- demand: who still needs what class (unregistered + no-show re-reg)
-    d1 = unreg[["UniversalID", "FullName", "Leader", "ClassKey", "Event_Class"]].copy()
+    d1 = unreg[["UniversalID", "FullName", "Leader", "UserType",
+                "ClassKey", "Event_Class"]].copy()
     d1["Reason"] = "Unregistered"
-    d2 = nss_rereg_needed[["UniversalID", "FullName", "Leader", "ClassKey", "ClassTitle"]].rename(
+    d2 = nss_rereg_needed[["UniversalID", "FullName", "Leader", "UserType",
+                           "ClassKey", "ClassTitle"]].rename(
         columns={"ClassTitle": "Event_Class"}).copy()
     d2["Reason"] = "No-Show — Re-register"
     demand = pd.concat([d1, d2], ignore_index=True)
     demand = demand.drop_duplicates(subset=["UniversalID", "ClassKey"], keep="first")
     demand["IsExcludedClass"] = demand["Event_Class"].fillna("").str.contains(EXCL_RE)
+    demand["UserTypeNorm"] = demand["UserType"].fillna("").str.strip().str.title()
+    _ut_unknown = sorted(set(demand["UserTypeNorm"]) - set(USER_TYPES))
+    if _ut_unknown:
+        print(f"  WARNING: placement demand carries User Type value(s) outside "
+              f"{list(USER_TYPES)}: {_ut_unknown}. Those people are counted in "
+              f"Grand Total but sit in none of the user-type columns, so the "
+              f"Unregistered Summary leader tables will not foot.")
 
     # ---- per-variant cube + long tables ------------------------------------
     cube_rows, t_curr, t_class, t_mgr, t_trend = [], [], [], [], []
@@ -327,7 +381,7 @@ def compute(f: dict) -> dict:
             # (same meaning as the original tracker's MAXIFS "Last Class Date")
             dated = s[s["EventDate"].notna()]
             last_row = dated.loc[dated["EventDate"].idxmax()] if len(dated) else None
-            cube_rows.append({
+            crow = {
                 "Key": f"{variant}|{name}", "Variant": variant, "Leader": name,
                 "Members": members,
                 "FullyTrained": trained,
@@ -353,7 +407,18 @@ def compute(f: dict) -> dict:
                 "LastClassDate": pd.NaT if last_row is None else last_row["EventDate"],
                 "DaysToGoLive": golive_label,
                 "GoLiveDate": pd.Timestamp(GO_LIVE),
-            })
+            }
+            # Team members needing placement, split by user type, for the
+            # Unregistered Summary leader tables. Each person carries exactly
+            # one user type, so the three columns sum to PlaceUnregTMs /
+            # PlaceNoShowTMs and the Grand Total column stays consistent.
+            for ut in USER_TYPES:
+                dmu = dm[dm["UserTypeNorm"] == ut]
+                crow[f"UnregTMs_{ut}"] = int(
+                    dmu[dmu["Reason"] == "Unregistered"]["UniversalID"].nunique())
+                crow[f"NoShowTMs_{ut}"] = int(
+                    dmu[dmu["Reason"] != "Unregistered"]["UniversalID"].nunique())
+            cube_rows.append(crow)
 
             # curriculum breakdown
             cb = (s.groupby("Curriculum", as_index=False)
@@ -609,6 +674,70 @@ def compute(f: dict) -> dict:
     log_week_totals = weekly(log_totals, by_leader=False)
     log_week_leader = weekly(log_leader, by_leader=True)
 
+    # ---- Monthly Log (her ask 2026-09-10) ---------------------------------
+    # Month-end status: the last snapshot of each calendar month, deltas vs the
+    # previous month. The current month rides on the latest snapshot until it
+    # closes, exactly like the Weekly Summary's current week.
+    def monthly(df, by_leader: bool):
+        d2 = df.copy()
+        d2["Month"] = d2["SnapshotDate"].dt.to_period("M").dt.start_time
+        keys = ["Leader"] if by_leader else []
+        idx = d2.groupby(keys + ["Month"])["SnapshotDate"].idxmax()
+        days = d2.groupby(keys + ["Month"])["SnapshotDate"].nunique()
+        mo = d2.loc[sorted(idx)].copy()
+        mo["DaysCaptured"] = mo.set_index(keys + ["Month"]).index.map(days)
+        mo = mo.sort_values(keys + ["Month"]).reset_index(drop=True)
+        for src, dst in delta_of.items():
+            mo[dst] = (mo.groupby("Leader")[src].diff() if by_leader
+                       else mo[src].diff())
+        mo["MonthLabel"] = mo["Month"].dt.strftime("%b %Y")
+        return mo
+
+    log_month_totals = monthly(log_totals, by_leader=False)
+    log_month_leader = monthly(log_leader, by_leader=True)
+
+    # Registration activity: Cornerstone transcripts dated in each month.
+    #   Sessions/People Registered  = registration date in the month (any status now)
+    #   Sessions/People Completed   = completed date in the month, status Completed
+    #   Withdrawals                 = status Withdrawn, by registration month
+    #                                 (Cornerstone exports no withdrawal date)
+    #   No-Shows                    = status No Show, by the session's start month
+    act = f["activity"].copy()
+    for c in ("RegDate", "StartDate", "CompletedDate"):
+        act[c] = pd.to_datetime(act[c], errors="coerce")
+    act["Status"] = act["Status"].astype(str).str.strip()
+    first_month = pd.Timestamp(ACTIVITY_START).to_period("M")
+    months = pd.period_range(first_month, today.to_period("M"), freq="M")
+
+    def activity(by_leader: bool):
+        keys = ["Leader"] if by_leader else []
+        groups = sorted(act["Leader"].dropna().unique()) if by_leader else [None]
+        rows = []
+        for g in groups:
+            sub = act[act["Leader"] == g] if by_leader else act
+            reg = sub[sub["RegDate"].notna()]
+            comp = sub[(sub["Status"] == "Completed") & sub["CompletedDate"].notna()]
+            wd = sub[(sub["Status"] == "Withdrawn") & sub["RegDate"].notna()]
+            ns = sub[(sub["Status"] == "No Show") & sub["StartDate"].notna()]
+            rp = reg["RegDate"].dt.to_period("M")
+            cp = comp["CompletedDate"].dt.to_period("M")
+            wp = wd["RegDate"].dt.to_period("M")
+            np_ = ns["StartDate"].dt.to_period("M")
+            for m in months:
+                rows.append({**({"Leader": g} if by_leader else {}),
+                             "Month": m.start_time, "MonthLabel": m.strftime("%b %Y"),
+                             "SessionsRegistered": int((rp == m).sum()),
+                             "PeopleRegistering": int(reg.loc[rp == m, "UniversalID"].nunique()),
+                             "SessionsCompleted": int((cp == m).sum()),
+                             "PeopleCompleting": int(comp.loc[cp == m, "UniversalID"].nunique()),
+                             "Withdrawals": int((wp == m).sum()),
+                             "NoShows": int((np_ == m).sum())})
+        out = pd.DataFrame(rows)
+        return out.sort_values(keys + ["Month"]).reset_index(drop=True)
+
+    act_month_totals = activity(by_leader=False)
+    act_month_leader = activity(by_leader=True)
+
     # ---- Visuals sheet feed (all leaders, Exclude scope, static) -----------
     exc = cube[(cube["Variant"] == "Exclude") & (cube["Leader"] != "All")]
     act = exc[exc["Members"] > 0].sort_values("Members")     # asc → largest bar on top
@@ -718,6 +847,8 @@ def compute(f: dict) -> dict:
             "fresh": f["fresh"], "scorecard": f["scorecard"],
             "log_totals": log_totals, "log_leader": log_leader,
             "log_week_totals": log_week_totals, "log_week_leader": log_week_leader,
+            "log_month_totals": log_month_totals, "log_month_leader": log_month_leader,
+            "act_month_totals": act_month_totals, "act_month_leader": act_month_leader,
             "viz": viz, "tstatus": ts, "tstat_leader": tstat_leader,
             "noshow": ns, "gnf": gnf, "gnf_leader": gnf_leader,
             "gnf_status": gnf_status,
@@ -813,6 +944,85 @@ def write_df(ws, df, fm, start_row=0, start_col=0, date_cols=(), num_cols=(),
             ws.set_column(start_col + c, start_col + c, wdt)
 
 
+def latest_lava() -> Path | None:
+    hits = sorted(LAVA_DIR.glob(LAVA_GLOB), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not hits:
+        hits = sorted(LAVA_DIR.glob(LAVA_GLOB_LEGACY), key=lambda f: f.stat().st_mtime, reverse=True)
+    return hits[0] if hits else None
+
+
+def copy_lava_sheets(wb, fm, lava_path: Path, asof: str) -> list[str]:
+    """Copy the LAVA workbook's sheets into the tracker as static snapshots.
+
+    Values only (the LAVA file is itself values-only), with the source layout
+    kept: column widths, freeze panes, AutoFilter, merged cells, hidden
+    gridlines. Styling is mapped onto the tracker's own formats so the sheets
+    read like the rest of the workbook: bold source cells become headers,
+    percent cells keep their percent format, dates stay dates.
+    """
+    from openpyxl.utils import column_index_from_string
+    from openpyxl.utils.cell import coordinate_from_string
+
+    src = openpyxl.load_workbook(lava_path, data_only=True)
+    made = []
+    for src_name, dst_name in LAVA_SHEETS:
+        if src_name not in src.sheetnames:
+            continue
+        s = src[src_name]
+        ws = wb.add_worksheet(dst_name)
+        ws.hide_gridlines(2)
+        anchors = {}        # top-left coordinate -> merged range
+        covered = set()     # every coordinate inside a merged range
+        for m in s.merged_cells.ranges:
+            anchors[f"{openpyxl.utils.get_column_letter(m.min_col)}{m.min_row}"] = m
+            for row in s.iter_rows(min_row=m.min_row, max_row=m.max_row,
+                                   min_col=m.min_col, max_col=m.max_col):
+                covered.update(c.coordinate for c in row)
+        for row in s.iter_rows():
+            for c in row:
+                v = c.value
+                if v is None:
+                    continue
+                if c.coordinate in anchors:
+                    m = anchors[c.coordinate]
+                    ws.merge_range(m.min_row - 1, m.min_col - 1, m.max_row - 1,
+                                   m.max_col - 1, str(v), fm.cell_wrap)
+                    continue
+                if c.coordinate in covered:
+                    continue
+                r, col = c.row - 1, c.column - 1
+                if c.row == 1 and col == 0:
+                    f = fm.h2
+                elif c.font is not None and c.font.bold:
+                    f = fm.th
+                elif "%" in (c.number_format or ""):
+                    f = fm.pct
+                elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                    f = fm.num
+                else:
+                    f = fm.cell
+                _w(ws, r, col, v, f, fm.dt)
+        # source stamp to the right of the title row, never over source cells
+        ws.write_string(0, s.max_column + 1,
+                        f"Copied from {lava_path.name}  ·  {asof}", fm.note)
+        for letter, dim in s.column_dimensions.items():
+            if dim.width:
+                ci = column_index_from_string(letter) - 1
+                ws.set_column(ci, ci, float(dim.width))
+        if s.auto_filter.ref:
+            a, b = s.auto_filter.ref.split(":")
+            ca, ra = coordinate_from_string(a)
+            cb, rb = coordinate_from_string(b)
+            ws.autofilter(ra - 1, column_index_from_string(ca) - 1,
+                          rb - 1, column_index_from_string(cb) - 1)
+        if s.freeze_panes:
+            cf, rf = coordinate_from_string(s.freeze_panes)
+            ws.freeze_panes(rf - 1, column_index_from_string(cf) - 1)
+        made.append(dst_name)
+    src.close()
+    return made
+
+
 def build_workbook(d: dict, path: Path) -> None:
     wb = xlsxwriter.Workbook(str(path), {"nan_inf_to_errors": True,
                                          "default_date_format": "m/d/yyyy"})
@@ -824,6 +1034,7 @@ def build_workbook(d: dict, path: Path) -> None:
     n_audit = len(d["audit"])
     built_at = datetime.now()
     asof = f"Data as of {built_at:%m/%d/%Y %I:%M %p}"
+    lava_path = latest_lava()
 
     def stamp_live(ws, row=3, col=1):
         # standard caption for sheets driven by the Control dropdown/toggle
@@ -881,6 +1092,16 @@ def build_workbook(d: dict, path: Path) -> None:
         ci = cube_cols.index(col_name)
         col = xlsxwriter.utility.xl_col_to_name(ci)
         return (f"XLOOKUP(ExclToggle&\"|\"&SelectedLeader,"
+                f"_Cube!$A$2:$A${n_cube + 1},"
+                f"_Cube!${col}$2:${col}${n_cube + 1})")
+
+    def cube_lookup_leader(col_name: str, leader: str) -> str:
+        # Same cube read, but pinned to one leader instead of SelectedLeader —
+        # for tables that list every leader as a row. Still honours ExclToggle.
+        ci = cube_cols.index(col_name)
+        col = xlsxwriter.utility.xl_col_to_name(ci)
+        safe = leader.replace('"', '""')
+        return (f"XLOOKUP(ExclToggle&\"|{safe}\","
                 f"_Cube!$A$2:$A${n_cube + 1},"
                 f"_Cube!${col}$2:${col}${n_cube + 1})")
 
@@ -998,6 +1219,13 @@ def build_workbook(d: dict, path: Path) -> None:
         ("Data", "🌐 Raw person × class detail — filter anything."),
         ("Glossary", "Reference — what each status means and how every number is calculated."),
     ]
+    if lava_path is not None:
+        NAV += [
+            ("LAVA Exec Summary", f"🌐 LAVA one-pager — copied from {lava_path.name}."),
+            ("LAVA List", "🌐 LAVA Wave census, one row per person (snapshot)."),
+            ("LAVA Guest House Roles", "🌐 MVP guest-house job roles and how many on the LAVA list hold each."),
+            ("LAVA SVC Export", "🌐 SVC provisioning export as received (snapshot)."),
+        ]
     ws.write_string(8, 1, "Navigation", fm.h2)
     for i, (sheet, desc) in enumerate(NAV, start=9):
         ws.write_url(i, 1, f"internal:'{sheet}'!A1", fm.link, sheet)
@@ -1592,20 +1820,32 @@ def build_workbook(d: dict, path: Path) -> None:
             f"{m2},\"\"),2,-1),\"\")", fm.cell)
     ws.write_string(r0, 9, "LEADER SUMMARY — ALL LEADERS (ignores the filter)",
                     fm.h2)
-    lsum = excl[["Leader", "Members", "FullyRegistered", "UnregUsers",
-                 "NoShowUsers", "LastClassDate"]].copy()
-    lsum.columns = ["Leader", "Members", "Fully Registered", "Unregistered",
-                    "No-Shows", "Last Class Date"]
+    # Completion % and Last Training Date added 2026-09-03 (her ask): the same
+    # per-leader completion the Training Status sheet shows, next to the last
+    # session anyone under that leader actually attended (max Last Attended
+    # from report.tracker_training_status). Last Class Date stays what it was:
+    # the leader's last SCHEDULED session, as on the Exec Dashboard.
+    tsd_ = d["tstatus"].copy()
+    tsd_["LastAttendedDate"] = pd.to_datetime(tsd_["LastAttendedDate"], errors="coerce")
+    last_trained = tsd_.groupby("Leader")["LastAttendedDate"].max()
+    lsum = excl[["Leader", "Members", "FullyRegistered", "FullyTrained",
+                 "PctTrained", "UnregUsers", "NoShowUsers", "LastClassDate"]].copy()
+    lsum["LastTrainingDate"] = lsum["Leader"].map(last_trained)
+    lsum.columns = ["Leader", "Members", "Fully Registered", "Fully Trained",
+                    "Completion %", "Unregistered", "No-Shows",
+                    "Last Class Date", "Last Training Date"]
     for c, name in enumerate(lsum.columns):
         ws.write_string(r0 + 1, 9 + c, name, fm.th)
     for i, row in enumerate(lsum.sort_values("Members", ascending=False)
                             .itertuples(index=False), start=r0 + 2):
         for c, v in enumerate(row):
-            _w(ws, i, 9 + c, v, fm.num if c else fm.cell, fm.dt)
-    # date formats on spilled Last Session columns
+            f_ = fm.cell if c == 0 else (fm.pct if lsum.columns[c] == "Completion %"
+                                         else fm.num)
+            _w(ws, i, 9 + c, v, f_, fm.dt)
+    # date formats on spilled Last Session columns + the two leader date columns
     ws.set_column(3, 3, 14, fm.dt)
     ws.set_column(7, 7, 14, fm.dt)
-    ws.set_column(14, 14, 16, fm.dt)
+    ws.set_column(16, 17, 16, fm.dt)
 
     # ---- Leader Tracking ---------------------------------------------------
     ws = wb.add_worksheet("Leader Tracking")
@@ -1737,11 +1977,11 @@ def build_workbook(d: dict, path: Path) -> None:
                        "Opt 1 Date", "Opt 1 Location", "Opt 1 Seats",
                        "Opt 2 Date", "Opt 2 Location", "Opt 2 Seats",
                        "Opt 3 Date", "Opt 3 Location", "Opt 3 Seats",
-                       "Assignment"]
+                       "Assignment", "Email"]
         write_df(ws, out, fm, start_row=4,
                  num_cols=["#", "Opt 1 Seats", "Opt 2 Seats", "Opt 3 Seats"],
                  widths=[4, 14, 24, 20, 20, 46, 11, 30, 9, 11, 30, 9, 11, 30,
-                         9, 20])
+                         9, 20, 30])
     else:
         ws.write_string(4, 0, "🎉 No one needs placement right now.", fm.h2)
 
@@ -1803,6 +2043,44 @@ def build_workbook(d: dict, path: Path) -> None:
     ws.write_string(11, 1, "Total", fm.th)
     ws.write_formula(11, 2, f"={cube_lookup('UnregUsers')}", fm.num)
     ws.write_formula(11, 4, f"={cube_lookup('UnregSessions')}", fm.num)
+
+    # ---- leader x user-type team-member counts -----------------------------
+    # Every leader is a row, so these two tables deliberately ignore the
+    # Control leader dropdown; they still follow the Exclude/Include toggle.
+    # Counts are distinct team members (a person needing 3 classes counts once),
+    # matching the "Team Members" column of the BREAKDOWN table above.
+    ut_note = ("🌐 Every leader — the Control leader filter does not apply to "
+               "this table; the Exclude/Include class toggle does.")
+    r = 13
+    for title, total_col, prefix in (
+            ("UNREGISTERED — BY LEADER & USER TYPE",
+             "PlaceUnregTMs", "UnregTMs"),
+            ("NO-SHOW (RE-REGISTER) — BY LEADER & USER TYPE",
+             "PlaceNoShowTMs", "NoShowTMs")):
+        ws.write_string(r, 1, title, fm.h2)
+        ws.write_string(r + 1, 1, ut_note, fm.note)
+        for c, name in enumerate(["Leader", *USER_TYPES, "Grand Total"]):
+            ws.write_string(r + 2, 1 + c, name, fm.th)
+        for i, leader in enumerate(d["leaders"]):
+            rr = r + 3 + i
+            ws.write_string(rr, 1, leader, fm.cell)
+            for c, ut in enumerate(USER_TYPES):
+                ws.write_formula(
+                    rr, 2 + c,
+                    f"={cube_lookup_leader(f'{prefix}_{ut}', leader)}", fm.num)
+            ws.write_formula(
+                rr, 2 + len(USER_TYPES),
+                f"={cube_lookup_leader(total_col, leader)}", fm.num)
+        tot = r + 3 + len(d["leaders"])
+        ws.write_string(tot, 1, "Total", fm.th)
+        for c, ut in enumerate(USER_TYPES):
+            ws.write_formula(
+                tot, 2 + c,
+                f"={cube_lookup_leader(f'{prefix}_{ut}', 'All')}", fm.num)
+        ws.write_formula(
+            tot, 2 + len(USER_TYPES),
+            f"={cube_lookup_leader(total_col, 'All')}", fm.num)
+        r = tot + 3
 
     # ---- Registration Audit (follows the leader filter) --------------------
     ws = wb.add_worksheet("Registration Audit")
@@ -1937,7 +2215,7 @@ def build_workbook(d: dict, path: Path) -> None:
                 ("Last Attended", "LastAttendedDate"),
                 ("Final Scheduled", "FinalScheduledDate"),
                 ("Unreg Classes", "UnregisteredClasses"),
-                ("Attention", "Attention")]
+                ("Attention", "Attention"), ("Email", "Email")]
     for c, (h, _) in enumerate(det_cols):
         ws.write_string(r0 + 1, 1 + c, h, fm.th)
     tsd = d["tstatus"]
@@ -2034,7 +2312,7 @@ def build_workbook(d: dict, path: Path) -> None:
                ("Current Session", "CurrentSessionDate"),
                ("Registered per Epic", "RegisteredPerEpic"),
                ("Resolution", "Resolution"),
-               ("Registration Action", "RegistrationAction")]
+               ("Registration Action", "RegistrationAction"), ("Email", "Email")]
     for c, (h, _) in enumerate(ns_cols):
         ws.write_string(4, 1 + c, h, fm.th)
     nsd = d["noshow"]
@@ -2103,7 +2381,7 @@ def build_workbook(d: dict, path: Path) -> None:
               ("Leader", "Leader"), ("User Role", "UserRole"),
               ("Business Unit", "BusinessUnit"),
               ("Go and Find Module", "GoAndFind"),
-              ("User Total GNFs", "UserGnfCount")]
+              ("User Total GNFs", "UserGnfCount"), ("Email", "Email")]
     for c, (h, _) in enumerate(g_cols):
         ws.write_string(r0 + 1, 1 + c, h, fm.th)
     gd = d["gnf"]
@@ -2125,7 +2403,14 @@ def build_workbook(d: dict, path: Path) -> None:
     write_df(ws, d["data"], fm, start_row=3,
              num_cols=["Sequence", "Duration Hours", "Is Excluded"],
              widths=[14, 26, 20, 16, 24, 12, 13, 12, 24, 26, 26, 44, 16, 10,
-                     44, 14, 12, 14, 10, 16, 22, 18, 18, 10])
+                     44, 14, 12, 14, 10, 16, 22, 18, 18, 10, 30])
+
+    # ---- LAVA (snapshot of the newest LAVA workbook) ----------------------
+    if lava_path is not None:
+        made = copy_lava_sheets(wb, fm, lava_path, asof)
+        print(f"  LAVA sheets: {', '.join(made)}  <- {lava_path.name}")
+    else:
+        print("  LAVA sheets: none (no LAVA workbook found in Main Reports)")
 
     wb.close()
 
@@ -2363,6 +2648,127 @@ def qa_crosscheck(d: dict) -> None:
         print("  !! numbers differ from the scorecard — investigate before sharing.")
 
 
+ACT_SPEC = [
+    ("Sessions Registered", "SessionsRegistered", "num"),
+    ("People Registering", "PeopleRegistering", "num"),
+    ("Sessions Completed", "SessionsCompleted", "num"),
+    ("People Completing", "PeopleCompleting", "num"),
+    ("Withdrawals", "Withdrawals", "num"),
+    ("No-Shows", "NoShows", "num"),
+]
+
+
+def _month_chart(wb, kind, title, series, cat_col, n, y_opts=None):
+    ch = wb.add_chart({"type": kind})
+    for label, colL, color in series:
+        spec = {"name": label,
+                "categories": f"=_ChartData!${cat_col}$2:${cat_col}${n + 1}",
+                "values": f"=_ChartData!${colL}$2:${colL}${n + 1}"}
+        if kind == "line":
+            spec["line"] = {"color": color, "width": 2}
+            spec["marker"] = {"type": "circle", "size": 5,
+                              "fill": {"color": color}, "border": {"color": color}}
+        else:
+            spec["fill"] = {"color": color}
+            spec["border"] = {"none": True}
+        ch.add_series(spec)
+    ch.set_title({"name": title, "name_font": {"name": "Segoe UI", "size": 11,
+                                                "color": INK, "bold": False}})
+    ch.set_legend({"position": "bottom", "font": {"name": "Segoe UI", "size": 9}})
+    ch.set_x_axis({"num_font": {"name": "Segoe UI", "size": 9}, "line": {"color": LINE}})
+    ch.set_y_axis({"num_font": {"name": "Segoe UI", "size": 9},
+                   "major_gridlines": {"visible": True, "line": {"color": LINE}},
+                   **(y_opts or {})})
+    ch.set_chartarea({"border": {"none": True}})
+    ch.set_size({"width": 540, "height": 250})
+    return ch
+
+
+def build_monthly_workbook(d: dict, path: Path) -> None:
+    """RCM Training Monthly Log (her ask 2026-09-10): month-end status like the
+    Weekly Summary, plus Cornerstone registration activity per month."""
+    wb = xlsxwriter.Workbook(str(path), {"nan_inf_to_errors": True,
+                                         "default_date_format": "m/d/yyyy"})
+    fm = Fmt(wb)
+    built_at = datetime.now()
+    mt, ml = d["log_month_totals"], d["log_month_leader"]
+    at, al = d["act_month_totals"], d["act_month_leader"]
+
+    # hidden ascending chart feed: activity (A-E) and month-end status (G-I)
+    ws_cd = wb.add_worksheet("_ChartData")
+    for c, col in enumerate(["MonthLabel", "SessionsRegistered", "SessionsCompleted",
+                             "Withdrawals", "NoShows"]):
+        ws_cd.write_string(0, c, col)
+        for i, v in enumerate(at[col], start=1):
+            _w(ws_cd, i, c, v, fm.num, fm.dt)
+    for c, col in enumerate(["MonthLabel", "FullyRegistered", "FullyTrained"], start=6):
+        ws_cd.write_string(0, c, col)
+        for i, v in enumerate(mt[col], start=1):
+            _w(ws_cd, i, c, v, fm.num, fm.dt)
+    ws_cd.hide()
+    n_act, n_mo = len(at), len(mt)
+
+    # ---- Monthly Totals ----------------------------------------------------
+    ws = wb.add_worksheet("Monthly Totals")
+    ws.hide_gridlines(2)
+    ws.set_column(0, 0, 2)
+    ws.set_column(1, 1, 11)
+    ws.set_column(2, 17, 11)
+    ws.write_string(1, 1, f"{TITLE} — Monthly Log", fm.title)
+    ws.write_string(
+        2, 1,
+        f"Newest first. Month-end status = the last snapshot day of each month "
+        f"(the current month shows the latest snapshot until it closes); Δ columns "
+        f"are month-over-month. Status history since 07/2026, unregistered and "
+        f"no-show since 07/15/2026. Registration activity counts Cornerstone Epic "
+        f"class sessions by the month they are dated, history since 01/2026. "
+        f"Rebuilt {built_at:%m/%d/%Y %I:%M %p}.", fm.note)
+    mspec = [("Month", "MonthLabel", "text"), ("Days", "DaysCaptured", "num")] + LOG_SPEC
+    ws.write_string(3, 1, "MONTH-END STATUS", fm.h2)
+    end = _log_table(ws, fm, mt, mspec, 4, newest_first=True, freeze=False)
+    r1 = end + 2
+    ws.write_string(r1, 1, "REGISTRATION ACTIVITY BY MONTH", fm.h2)
+    aspec = [("Month", "MonthLabel", "text")] + ACT_SPEC
+    end2 = _log_table(ws, fm, at, aspec, r1 + 1, newest_first=True, freeze=False)
+    ws.write_string(end2 + 1, 1,
+                    "Sessions Registered = class sessions with a registration date in the "
+                    "month, whatever their status today. Completed = completion date in "
+                    "the month. Withdrawals are counted by registration month (Cornerstone "
+                    "exports no withdrawal date). No-Shows are counted by the session date.",
+                    fm.note)
+    if n_act >= 2:
+        ws.insert_chart(4, 19, _month_chart(
+            wb, "column", "Registration activity by month",
+            (("Sessions Registered", "B", ACCENT), ("Sessions Completed", "C", "#4E9A6F"),
+             ("Withdrawals", "D", ACCENT2), ("No-Shows", "E", "#C0504D")), "A", n_act))
+    if n_mo >= 2:
+        ws.insert_chart(18, 19, _month_chart(
+            wb, "line", "Month-end status",
+            (("Fully Registered", "H", ACCENT), ("Fully Trained", "I", "#4E9A6F")),
+            "G", n_mo))
+
+    # ---- Monthly by Leader -------------------------------------------------
+    ws = wb.add_worksheet("Monthly by Leader")
+    ws.hide_gridlines(2)
+    ws.set_column(0, 0, 2)
+    ws.set_column(1, 1, 11)
+    ws.set_column(2, 2, 20)
+    ws.set_column(3, 18, 11)
+    ws.write_string(1, 1, "Monthly Log — By Leader", fm.title)
+    ws.write_string(2, 1, f"Newest first. Filter the Leader column for a single-leader "
+                          f"trend. Δ columns compare to that leader's previous month. "
+                          f"Rebuilt {built_at:%m/%d/%Y %I:%M %p}.", fm.note)
+    mlspec = [("Month", "MonthLabel", "text"), ("Leader", "Leader", "text"),
+              ("Days", "DaysCaptured", "num")] + LOG_SPEC
+    ws.write_string(3, 1, "MONTH-END STATUS BY LEADER (filter any column)", fm.h2)
+    end = _log_table(ws, fm, ml, mlspec, 4, newest_first=True, autofilter=True, freeze=False)
+    r1 = end + 2
+    ws.write_string(r1, 1, "REGISTRATION ACTIVITY BY LEADER AND MONTH (filter any column)", fm.h2)
+    alspec = [("Month", "MonthLabel", "text"), ("Leader", "Leader", "text")] + ACT_SPEC
+    _log_table(ws, fm, al, alspec, r1 + 1, newest_first=True, autofilter=True, freeze=False)
+    wb.close()
+
+
 def excel_check(path: Path) -> bool:
     """Open in Excel (invisible), force a recalc, scan for error values.
     Returns True when clean. Run against the STAGED copy so Excel never
@@ -2410,7 +2816,7 @@ def main() -> int:
             print(f"  auto_refresh exited {rc} — building from what's loaded.")
 
     # refuse to clobber a workbook that's open in Excel
-    for p in (OUT_PATH, LOG_PATH):
+    for p in (OUT_PATH, LOG_PATH, MONTHLY_PATH):
         if p.exists():
             try:
                 with open(p, "r+b"):
@@ -2434,6 +2840,22 @@ def main() -> int:
     print("Computing…")
     d = compute(frames)
 
+    # One address per person, from the same resolver the Master, Team File, LAVA
+    # and Soft Live list use, so the tracker can never disagree with them about
+    # someone's email (her ask 2026-09-02). Attached centrally rather than in
+    # each query so every person-level sheet picks it up the same way.
+    eng2 = create_engine(CONN)
+    emails = email_map(eng2)
+    eng2.dispose()
+    for key, frame in d.items():
+        if not isinstance(frame, pd.DataFrame) or "Email" in frame.columns:
+            continue
+        uid = next((c for c in ("UniversalID", "Universal Id") if c in frame.columns), None)
+        if uid:
+            d[key] = frame.assign(
+                Email=frame[uid].astype(str).str.strip().str.upper().map(emails))
+    print(f"  email attached to {sum(1 for f in d.values() if isinstance(f, pd.DataFrame) and 'Email' in f.columns)} frame(s)")
+
     print("Writing workbooks (local staging)…")
     STAGING.mkdir(exist_ok=True)
     stage_out = STAGING / OUT_PATH.name
@@ -2442,10 +2864,13 @@ def main() -> int:
     print(f"Built {stage_out.name}  ({stage_out.stat().st_size / 1e6:.1f} MB)")
     build_log_workbook(d, stage_log)
     print(f"Built {stage_log.name}  ({stage_log.stat().st_size / 1e6:.1f} MB)")
+    stage_month = STAGING / MONTHLY_PATH.name
+    build_monthly_workbook(d, stage_month)
+    print(f"Built {stage_month.name}  ({stage_month.stat().st_size / 1e6:.1f} MB)")
 
     qa_crosscheck(d)
     if args.excel_check:
-        for p in (stage_out, stage_log):
+        for p in (stage_out, stage_log, stage_month):
             print(f"Excel recalc check (staged) — {p.name}…")
             if not excel_check(p):
                 print("ABORT: recalc errors in the staged build — nothing "
@@ -2455,7 +2880,8 @@ def main() -> int:
     # publish: ONE atomic copy per file onto the OneDrive path — the synced
     # folder never sees a partially-written workbook or an Excel session.
     import shutil
-    for src, dst in ((stage_out, OUT_PATH), (stage_log, LOG_PATH)):
+    for src, dst in ((stage_out, OUT_PATH), (stage_log, LOG_PATH),
+                     (stage_month, MONTHLY_PATH)):
         tmp = dst.with_suffix(".publishing.xlsx")
         try:
             shutil.copy2(src, tmp)

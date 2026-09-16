@@ -103,7 +103,7 @@ bu_need = one("SELECT COUNT(*) FROM dim.business_unit WHERE NeedsMapping = 1")
 check("dim.business_unit NeedsMapping == 0 (all Master BUs seeded into ref)",
       bu_need == 0, f"{bu_need}")
 ldr_rev = one("SELECT COUNT(*) FROM dim.leader WHERE NeedsReview = 1")
-check("dim.leader NeedsReview == 0 (JLIM9 typo fixed by 2026-07-21)", ldr_rev == 0, f"{ldr_rev}")
+check("dim.leader NeedsReview == 0 (USER07UID typo fixed by 2026-07-21)", ldr_rev == 0, f"{ldr_rev}")
 
 vend_sum = one("SELECT SUM(MasterPeople) FROM dim.vendor")
 master_vend = one("""SELECT COUNT(*) FROM raw.[master] m JOIN dim.vendor_alias va

@@ -105,6 +105,32 @@ the scripts that edit a live workbook through Excel itself.
 - **No black boxes** — live Excel filtering via native dynamic arrays instead
   of macros/VBA; HTML dashboards are dependency-free generated files.
 
+## Agent team (`agents/`)
+
+The toolkit ships with a small team of specialist agent definitions so the
+daily operation can be delegated safely. They are plain markdown, written to
+run in any agent runtime — including a local, self-hosted model, which is the
+right choice in regulated settings. The session the analyst types into is
+the orchestrator: it routes, holds every approval, and is the only party that
+asks the human questions.
+
+| Role | Owns | Writes? |
+|---|---|---|
+| `morning-review` | prep stage, run diagnosis, feed health | no |
+| `wave-file-steward` | roster workbook previews and change lists | no |
+| `training-registration-expert` | status semantics, source-authority questions | no |
+| `data-analyst` | headcounts, tables, quick pulls | no |
+| `report-builder` | Excel / HTML deliverables, local-first then publish | yes |
+| `pipeline-engineer` | scripts, SQL views, docs, guard allowlist | yes |
+
+Rules that make this safe: read-only roles have file writes denied; no role
+runs the apply stage or passes `--apply`; anything approval-gated comes back
+as a `DECISION NEEDED` block (what / evidence / recommended) for the human to
+answer; a pre-write guard sits in front of every file write and shell
+command. `agents/playbooks/` holds the `start-day` and `end-day` procedures.
+See [agents/README.md](agents/README.md) for the routing table and how to
+load the roles into your own runtime.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

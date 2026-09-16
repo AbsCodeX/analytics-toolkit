@@ -7,8 +7,9 @@
 review_hr_leader_changes.py
 
 READ-ONLY preview of the leader changes that update_master_from_hr_safe.py WOULD
-make on its next real run. Writes the full list to a CSV in the OneDrive
-morning-review folder (data\\reports\\morning_review\\hr_leader_changes_preview.csv,
+make on its next real run. Writes the full list to a CSV next to the Master
+(LOCAL since 2026-08-11: yourorg_analytics\\data\\reports\\Main Reports\\
+hr_leader_changes_preview.csv — path constant onedrive_paths.HR_PREVIEW_CSV_PATH,
 where build_morning_review.py folds it into Morning Review.xlsx) and prints an
 on-screen table so you can verify BEFORE applying (i.e. before running
 update_master_from_hr_safe.py with no flag, which applies by default).
@@ -68,9 +69,9 @@ from update_master_from_hr_safe import (  # noqa: E402  pylint: disable=wrong-im
     read_col,
 )
 
-# Saved with the rest of the morning-review surfaces on OneDrive —
+# Saved next to Morning Review.xlsx in Main Reports —
 # build_morning_review.py reads it from here into Morning Review.xlsx.
-OUT_CSV = onedrive_paths.MORNING_REVIEW_DIR / "hr_leader_changes_preview.csv"
+OUT_CSV = onedrive_paths.HR_PREVIEW_CSV_PATH
 
 # Optional person-name column on the DATA sheet (first match wins; blank if none).
 _NAME_CANDIDATES = ("Name", "Full Name", "Employee Name", "Worker", "Last Name")

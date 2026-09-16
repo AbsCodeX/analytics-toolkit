@@ -31,6 +31,10 @@ USAGE
 -----
     python scripts/add_missing_to_master.py            # DRY RUN preview
     python scripts/add_missing_to_master.py --apply    # backup + append + log
+    python scripts/add_missing_to_master.py --uids USER01UID USER02UID --source "Front Desk list" [--apply]
+        # 2026-09-11: append an explicit list (a manager's roster, a change
+        # request) instead of the Epic/HR discovery; same enrichment, same
+        # safe-write path; IDs already on the Master are skipped and reported.
 """
 
 import argparse
@@ -153,7 +157,7 @@ def load_master_uids():
 def load_epic_centralized():
     if not EPIC_PATH.exists():
         sys.exit(f"ERROR: Epic export not found: {EPIC_PATH}")
-    df = pd.read_excel(EPIC_PATH, sheet_name="Export", engine="openpyxl", dtype=str)
+    df = pd.read_excel(EPIC_PATH, sheet_name="Export", engine="calamine", dtype=str)
     for col in ("Universal ID", "Curriculum Type", "Team Member"):
         if col not in df.columns:
             sys.exit(f"ERROR: Epic Export sheet is missing column '{col}'.")
@@ -169,7 +173,7 @@ def load_hr_cleaned_all_staff():
     path = op.latest_hr_cleaned()
     if path is None:
         sys.exit("ERROR: no HR_cleaned_*.xlsx found — run clean_hr.py first.")
-    df = pd.read_excel(path, sheet_name="All Staff", engine="openpyxl", dtype=str)
+    df = pd.read_excel(path, sheet_name="All Staff", engine="calamine", dtype=str)
     for col in ("UniversalID", "SVP", "Leaders", "Full Name"):
         if col not in df.columns:
             sys.exit(f"ERROR: '{path.name}' All Staff is missing column '{col}'.")
@@ -182,8 +186,9 @@ def load_hr_raw():
     """Raw HR keyed by UID for identity detail (names, EmployeeID, JobTitle...)."""
     if not HR_RAW_PATH.exists():
         return pd.DataFrame().set_index(pd.Index([], name="UID")), None
-    sheet = openpyxl.load_workbook(HR_RAW_PATH, read_only=True).sheetnames[0]
-    hr = pd.read_excel(HR_RAW_PATH, sheet_name=sheet, engine="openpyxl", dtype=str)
+    with pd.ExcelFile(HR_RAW_PATH, engine="calamine") as xl:
+        sheet = xl.sheet_names[0]
+        hr = pd.read_excel(xl, sheet_name=sheet, dtype=str)
     hr["UID"] = hr["UniversalID"].map(norm_uid)
     hr = hr.dropna(subset=["UID"]).drop_duplicates(subset=["UID"])
     return hr.set_index("UID"), sheet
@@ -266,7 +271,7 @@ def office_lock_present(path):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main(apply):
+def main(apply, uids=None, source=None):
     banner = "LIVE RUN — WILL APPEND ROWS" if apply else "DRY RUN — NOTHING WILL BE WRITTEN"
     print("=" * 72)
     print(f"  add_missing_to_master.py   [{banner}]")
@@ -276,19 +281,32 @@ def main(apply):
     print(f"Master UIDs: {len(master_uids):,}")
 
     epic = load_epic_centralized()
-    epic_new = [u for u in epic.index if u not in master_uids]
-    print(f"Epic '{TARGET_CURRICULUM}': {len(epic):,} people | "
-          f"already in Master: {len(epic) - len(epic_new):,} | NEW: {len(epic_new)}")
-
     staff, staff_path = load_hr_cleaned_all_staff()
-    lastname03 = staff[staff["SVP"].astype(str).str.strip() == TARGET_SVP]
-    brogan_active = lastname03[~lastname03.get("IsDeparted/Inactive?", "").map(is_true)]
-    hr_new = [u for u in brogan_active.index if u not in master_uids and u not in set(epic_new)]
-    print(f"HR All Staff ({staff_path.name}) SVP={TARGET_SVP}: {len(lastname03):,} people "
-          f"({len(lastname03) - len(brogan_active)} departed excluded) | NEW: {len(hr_new)}\n")
-
-    additions = [(u, "Epic Centralized") for u in sorted(epic_new)] + \
-                [(u, "HR Lastname03 org") for u in sorted(hr_new)]
+    if uids:
+        # Explicit list mode (2026-09-11): the caller says who; discovery is skipped.
+        source = source or "explicit list"
+        wanted = [norm_uid(u) for u in uids]
+        wanted = [u for u in wanted if u]
+        already = [u for u in wanted if u in master_uids]
+        additions = [(u, source) for u in sorted(set(wanted) - set(already))]
+        epic_new, hr_new, brogan_active = [], [], staff.iloc[0:0]
+        print(f"Explicit list ({source}): {len(wanted)} ID(s) | already in Master: "
+              f"{len(already)} | NEW: {len(additions)}")
+        not_in_hr = [u for u, _ in additions if u not in staff.index]
+        if not_in_hr:
+            print(f"  WARNING — not in HR All Staff (identity/leaders will be thin): {', '.join(not_in_hr)}")
+        print()
+    else:
+        epic_new = [u for u in epic.index if u not in master_uids]
+        print(f"Epic '{TARGET_CURRICULUM}': {len(epic):,} people | "
+              f"already in Master: {len(epic) - len(epic_new):,} | NEW: {len(epic_new)}")
+        lastname03 = staff[staff["SVP"].astype(str).str.strip() == TARGET_SVP]
+        brogan_active = lastname03[~lastname03.get("IsDeparted/Inactive?", "").map(is_true)]
+        hr_new = [u for u in brogan_active.index if u not in master_uids and u not in set(epic_new)]
+        print(f"HR All Staff ({staff_path.name}) SVP={TARGET_SVP}: {len(lastname03):,} people "
+              f"({len(lastname03) - len(brogan_active)} departed excluded) | NEW: {len(hr_new)}\n")
+        additions = [(u, "Epic Centralized") for u in sorted(epic_new)] + \
+                    [(u, "HR Lastname03 org") for u in sorted(hr_new)]
     if not additions:
         print("Nothing to add — no one is missing from the Master.")
         return
@@ -301,6 +319,7 @@ def main(apply):
     rows = [build_row(u, src, epic, staff, hr_raw) for u, src in additions]
     out_df = pd.DataFrame(rows)
     out_df.insert(1, "Source", [src for _, src in additions])
+    CSV_OUT.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(CSV_OUT, index=False)
 
     show = ["UniversalID", "Source", "Full Name", "GoLiveWave", "JobTitle", "Leaders"]
@@ -391,8 +410,9 @@ def main(apply):
     wave_str = "; ".join(f"{k}={v}" for k, v in wave_counts.items())
     runlog.append(RUNLOG_TAB, RUNLOG_HEADERS, [
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Epic TM Lookup (Centralized) + HR_cleaned (SVP Lastname03)",
-        len(epic) + len(brogan_active),
+        (f"Explicit list: {source}" if uids else
+         "Epic TM Lookup (Centralized) + HR_cleaned (SVP Lastname03)"),
+        (len(uids) if uids else len(epic) + len(brogan_active)),
         (len(epic) - len(epic_new)) + (len(brogan_active) - len(hr_new)),
         len(additions), len(additions), wave_str,
         ", ".join(out_df["UniversalID"].tolist()),
@@ -407,5 +427,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true",
                     help="Back up the Master and append. Default is a dry-run preview.")
+    ap.add_argument("--uids", nargs="+", metavar="UID",
+                    help="Append exactly these Universal IDs (skips Epic/HR discovery).")
+    ap.add_argument("--source", default=None,
+                    help="Label for the Notes/Change Log when --uids is used, e.g. the list's name.")
+    args = ap.parse_args()
     with track_run("Add Missing to Master"):
-        main(apply=ap.parse_args().apply)
+        main(apply=args.apply, uids=args.uids, source=args.source)

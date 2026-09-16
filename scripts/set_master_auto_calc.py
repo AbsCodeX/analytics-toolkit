@@ -28,6 +28,7 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
 import activity_log                  # noqa: E402
+import master_backup                 # noqa: E402
 import onedrive_paths as op          # noqa: E402
 
 XL_CALCULATION_AUTOMATIC = -4105  # Excel enum xlCalculationAutomatic
@@ -41,6 +42,12 @@ def master_locked() -> bool:
 def main() -> None:
     if master_locked():
         sys.exit("ERROR: the Master is open in Excel. Close it and rerun.")
+
+    try:
+        backup = master_backup.ensure_daily_full_backup(op.MASTER_WAVE_PATH)
+    except PermissionError:
+        sys.exit(f"ERROR: Could not create backup (permission denied): {op.MASTER_WAVE_PATH}")
+    print(f"Backup: {backup.name}")
 
     import xlwings as xw
 
@@ -59,6 +66,9 @@ def main() -> None:
     finally:
         if app is not None:
             app.quit()
+
+    snap = master_backup.save_data_snapshot(op.MASTER_WAVE_PATH)
+    print(f"DATA snapshot: {snap}")
 
 
 if __name__ == "__main__":

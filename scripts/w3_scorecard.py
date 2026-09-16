@@ -219,7 +219,7 @@ def main() -> None:
 
   Why it says "Review" instead of something definitive: the label trusts
   Epic's export, and we've already caught Epic disagreeing with itself once —
-  SBOWEN6's ED Nurse class is gone from Epic's curriculum export, yet Epic's
+  USER05UID's ED Nurse class is gone from Epic's curriculum export, yet Epic's
   no-show scorecard still says she needs re-registering. So the honest read
   is "Epic says this class isn't required anymore — a human should confirm
   whether that's a real curriculum change (do nothing, or book their new

@@ -64,6 +64,13 @@ EXCLUDABLE_LEADERS = ["Lastname09, Firstname09", "Lastname02, Firstname02"]
 
 DARK_BLUE = "#002092"
 GREEN = "#16A34A"
+# Registered vs Fully Trained trend (her ask 2026-09-14). Two user-count series on
+# one axis. Palette blue + aqua: validated as a categorical pair (lightness band,
+# chroma, CVD and normal-vision separation, contrast); aqua rather than GREEN
+# because GREEN is the "went up" status color on this page and status hues are
+# never reused for a series.
+REG_BLUE = "#2a78d6"
+TRAINED_AQUA = "#1baf7a"
 LOW_PCT_FLAG = 50.0  # leader rows under this Reg % get the amber flag
 
 
@@ -200,9 +207,10 @@ def render(excluded: tuple[str, ...], sc: pd.DataFrame, hist: pd.DataFrame,
         return f"{d.month}/{d.day}"
 
     daily = h.groupby("SnapshotDate", as_index=False).agg(
-        Reg=("FullyRegistered", "sum"), Unreg=("UnregisteredUsers", "sum"),
-        NS=("NoShowUsersStanding", "sum"))
+        Reg=("FullyRegistered", "sum"), Trn=("FullyTrained", "sum"),
+        Unreg=("UnregisteredUsers", "sum"), NS=("NoShowUsersStanding", "sum"))
     reg_d = {dlab(d): float(v) for d, v in zip(daily.SnapshotDate, daily.Reg)}
+    trn_d = {dlab(d): float(v) for d, v in zip(daily.SnapshotDate, daily.Trn)}
     unreg_d = {dlab(d): float(v) for d, v in zip(daily.SnapshotDate, daily.Unreg)}
     # no-show series: the 7/13-based reconstruction is org-wide for our
     # leaders; keep it whenever the excluded leaders have zero no-shows ever
@@ -217,8 +225,10 @@ def render(excluded: tuple[str, ...], sc: pd.DataFrame, hist: pd.DataFrame,
     reg_dates = sorted(reg_d, key=lambda s: tuple(int(p) for p in s.split("/")))
     mix_dates = sorted(set(unreg_d) | set(ns_d),
                        key=lambda s: tuple(int(p) for p in s.split("/")))
-    trend_reg = dual_line_chart(reg_dates, [("Registered Users", DARK_BLUE, reg_d)],
-                                aria="Registered users daily trend")
+    trend_reg = dual_line_chart(reg_dates, [
+        ("Registered Users", REG_BLUE, reg_d),
+        ("Fully Trained Users", TRAINED_AQUA, trn_d),
+    ], aria="Registered vs fully trained users daily trend", labels="ends")
     trend_mix = dual_line_chart(mix_dates, [
         ("Unregistered Users", BRIGHT_BLUE, unreg_d),
         ("Standing No-Show Users", RED, ns_d),
@@ -343,7 +353,7 @@ def render(excluded: tuple[str, ...], sc: pd.DataFrame, hist: pd.DataFrame,
 
     <div class="trend-grid">
         <div>
-            <div class="panel-title">Registered Users &mdash; daily</div>
+            <div class="panel-title">Registered vs Fully Trained Users &mdash; daily</div>
             {trend_reg}
         </div>
         <div>
